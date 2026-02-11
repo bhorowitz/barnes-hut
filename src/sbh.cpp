@@ -1,6 +1,9 @@
 #define _USE_MATH_DEFINES
 #include <pybind11/eigen.h>
+#include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
+
+#include <cstring>
 
 #include <Eigen/Core>
 
@@ -24,6 +27,14 @@
 #include "tree_sampler.h"
 
 namespace py = pybind11;
+
+template <typename T>
+py::array_t<uint8_t> vector_to_bytes(const std::vector<T>& vec) {
+  size_t nbytes = vec.size() * sizeof(T);
+  py::array_t<uint8_t> out(nbytes);
+  std::memcpy(out.mutable_data(), vec.data(), nbytes);
+  return out;
+}
 using namespace py::literals;
 
 std::random_device dev;
@@ -180,36 +191,62 @@ PYBIND11_MODULE(sbh, m) {
   m.doc() =
       "A plugin to expose deterministic and stochastic Barnes-Hut algorithms";
 
-  py::class_<PyQuadtree1>(m, "Quadtree1")
-      .def(py::init<const DynamicMatrix&, const DynamicMatrix&,
-                    const DynamicVector&, VectorNd<2>, VectorNd<2>, FLOAT>(),
-           "points"_a, "normals"_a, "masses"_a, "min_corner"_a, "max_corner"_a,
-           "alpha"_a = 1.0);
-  py::class_<PyQuadtree2>(m, "Quadtree2")
-      .def(py::init<const DynamicMatrix&, const DynamicMatrix&,
-                    const DynamicVector&, VectorNd<2>, VectorNd<2>, FLOAT>(),
-           "points"_a, "normals"_a, "masses"_a, "min_corner"_a, "max_corner"_a,
-           "alpha"_a = 1.0);
-  py::class_<PyQuadtree3>(m, "Quadtree3")
-      .def(py::init<const DynamicMatrix&, const DynamicMatrix&,
-                    const DynamicVector&, VectorNd<2>, VectorNd<2>, FLOAT>(),
-           "points"_a, "normals"_a, "masses"_a, "min_corner"_a, "max_corner"_a,
-           "alpha"_a = 1.0);
-  py::class_<PyOctree1>(m, "Octree1")
-      .def(py::init<const DynamicMatrix&, const DynamicMatrix&,
-                    const DynamicVector&, VectorNd<3>, VectorNd<3>, FLOAT>(),
-           "points"_a, "normals"_a, "masses"_a, "min_corner"_a, "max_corner"_a,
-           "alpha"_a = 1.0);
-  py::class_<PyOctree2>(m, "Octree2")
-      .def(py::init<const DynamicMatrix&, const DynamicMatrix&,
-                    const DynamicVector&, VectorNd<3>, VectorNd<3>, FLOAT>(),
-           "points"_a, "normals"_a, "masses"_a, "min_corner"_a, "max_corner"_a,
-           "alpha"_a = 1.0);
-  py::class_<PyOctree3>(m, "Octree3")
-      .def(py::init<const DynamicMatrix&, const DynamicMatrix&,
-                    const DynamicVector&, VectorNd<3>, VectorNd<3>, FLOAT>(),
-           "points"_a, "normals"_a, "masses"_a, "min_corner"_a, "max_corner"_a,
-           "alpha"_a = 1.0);
+  auto q1 = py::class_<PyQuadtree1>(m, "Quadtree1")
+                .def(py::init<const DynamicMatrix&, const DynamicMatrix&,
+                              const DynamicVector&, VectorNd<2>, VectorNd<2>, FLOAT>(),
+                     "points"_a, "normals"_a, "masses"_a, "min_corner"_a, "max_corner"_a,
+                     "alpha"_a = 1.0);
+  auto q2 = py::class_<PyQuadtree2>(m, "Quadtree2")
+                .def(py::init<const DynamicMatrix&, const DynamicMatrix&,
+                              const DynamicVector&, VectorNd<2>, VectorNd<2>, FLOAT>(),
+                     "points"_a, "normals"_a, "masses"_a, "min_corner"_a, "max_corner"_a,
+                     "alpha"_a = 1.0);
+  auto q3 = py::class_<PyQuadtree3>(m, "Quadtree3")
+                .def(py::init<const DynamicMatrix&, const DynamicMatrix&,
+                              const DynamicVector&, VectorNd<2>, VectorNd<2>, FLOAT>(),
+                     "points"_a, "normals"_a, "masses"_a, "min_corner"_a, "max_corner"_a,
+                     "alpha"_a = 1.0);
+  auto o1 = py::class_<PyOctree1>(m, "Octree1")
+                .def(py::init<const DynamicMatrix&, const DynamicMatrix&,
+                              const DynamicVector&, VectorNd<3>, VectorNd<3>, FLOAT>(),
+                     "points"_a, "normals"_a, "masses"_a, "min_corner"_a, "max_corner"_a,
+                     "alpha"_a = 1.0);
+  auto o2 = py::class_<PyOctree2>(m, "Octree2")
+                .def(py::init<const DynamicMatrix&, const DynamicMatrix&,
+                              const DynamicVector&, VectorNd<3>, VectorNd<3>, FLOAT>(),
+                     "points"_a, "normals"_a, "masses"_a, "min_corner"_a, "max_corner"_a,
+                     "alpha"_a = 1.0);
+  auto o3 = py::class_<PyOctree3>(m, "Octree3")
+                .def(py::init<const DynamicMatrix&, const DynamicMatrix&,
+                              const DynamicVector&, VectorNd<3>, VectorNd<3>, FLOAT>(),
+                     "points"_a, "normals"_a, "masses"_a, "min_corner"_a, "max_corner"_a,
+                     "alpha"_a = 1.0);
+
+  auto add_tree_bytes = [](auto& cls) {
+    using TreeType = typename std::decay_t<decltype(cls)>::type;
+    cls.def("leaf_data_bytes", [](const TreeType& tree) {
+         return vector_to_bytes(tree.leaf_data);
+       })
+       .def("node_buffer_bytes", [](const TreeType& tree) {
+         return vector_to_bytes(tree.tree->node_vector());
+       })
+       .def("contrib_data_bytes", [](const TreeType& tree) {
+         return vector_to_bytes(tree.tree->contrib_data_vector());
+       })
+       .def("num_points", [](const TreeType& tree) {
+         return static_cast<int>(tree.leaf_data.size());
+       })
+       .def("num_nodes", [](const TreeType& tree) {
+         return static_cast<int>(tree.tree->node_vector().size());
+       });
+  };
+
+  add_tree_bytes(q1);
+  add_tree_bytes(q2);
+  add_tree_bytes(q3);
+  add_tree_bytes(o1);
+  add_tree_bytes(o2);
+  add_tree_bytes(o3);
 
   m.attr("fp") = 8*sizeof(FLOAT);
 

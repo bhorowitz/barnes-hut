@@ -1,0 +1,11 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sbh-jax"
+version = "0.0.1"
+description = "JAX FFI bindings for stochastic-barnes-hut"
+readme = "README.md"
+requires-python = ">=3.9"
+
