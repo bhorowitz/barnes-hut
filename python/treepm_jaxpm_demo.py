@@ -115,8 +115,8 @@ def _evolve_with_odeint(
         (pos0, vel0),
         a_eval,
         cosmo,
-        rtol=1e-8,
-        atol=1e-8,
+        rtol=1e-3,
+        atol=1e-3,
     )
     return _wrap_periodic_mesh(res[0], mesh_n)
 
@@ -246,6 +246,7 @@ def run(cfg: Config, out_npz: str, out_proj_png: str, out_pk_png: str) -> None:
 
     pm_ode = jpm.make_ode_fn((cfg.mesh_n, cfg.mesh_n, cfg.mesh_n))
     short_scale = cfg.tree_short_scale
+    print(f"tree-short-scale (input): {short_scale:.6g}")
     if short_scale <= 0.0:
         short_scale = _fit_tree_short_scale(pos0, masses, cfg)
         print(f"auto tree-short-scale: {short_scale:.6g}")
@@ -309,9 +310,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--omega-c", type=float, default=0.25)
     p.add_argument("--sigma8", type=float, default=0.8)
     p.add_argument("--pm-r-split-cells", type=float, default=1.0)
-    p.add_argument("--tree-short-scale", type=float, default=-1.0)
+    p.add_argument("--tree-short-scale", type=float, default=0.10)
     p.add_argument("--bh-beta", type=float, default=1.7)
-    p.add_argument("--bh-softening", type=float, default=1.5)
+    p.add_argument("--bh-softening", type=float, default=0.1)
     p.add_argument("--bh-max-depth", type=int, default=6)
     p.add_argument("--out-npz", type=str, default="treepm_jaxpm_demo.npz")
     p.add_argument("--out-proj-png", type=str, default="treepm_jaxpm_projected_density.png")
