@@ -613,7 +613,13 @@ def build_octree8_buffers_with_contrib(
 
 
 def barnes_hut_gravity(
-    leaf_bytes: jnp.ndarray, node_bytes: jnp.ndarray, queries: jnp.ndarray, *, beta: float = 2.0
+    leaf_bytes: jnp.ndarray,
+    node_bytes: jnp.ndarray,
+    queries: jnp.ndarray,
+    *,
+    beta: float = 2.0,
+    periodic: bool = False,
+    box_length: float = 1.0,
 ) -> jnp.ndarray:
     leaf_bytes = jnp.asarray(leaf_bytes, dtype=jnp.uint8)
     node_bytes = jnp.asarray(node_bytes, dtype=jnp.uint8)
@@ -621,17 +627,32 @@ def barnes_hut_gravity(
 
     if queries.ndim != 2 or queries.shape[1] not in (2, 3):
         raise ValueError("queries must be (M, 2) or (M, 3)")
+    if periodic and box_length <= 0:
+        raise ValueError("box_length must be > 0 when periodic=True")
 
     out_shape = jax.ShapeDtypeStruct((queries.shape[0],), jnp.float32)
     target = _TARGET_BH if queries.shape[1] == 2 else _TARGET_BH_3D
     return jax.ffi.ffi_call(
         target,
         result_shape_dtypes=out_shape,
-    )(leaf_bytes, node_bytes, queries, beta=np.float32(beta))
+    )(
+        leaf_bytes,
+        node_bytes,
+        queries,
+        beta=np.float32(beta),
+        periodic=np.int32(1 if periodic else 0),
+        box_length=np.float32(box_length),
+    )
 
 
 def barnes_hut_force(
-    leaf_bytes: jnp.ndarray, node_bytes: jnp.ndarray, queries: jnp.ndarray, *, beta: float = 2.0
+    leaf_bytes: jnp.ndarray,
+    node_bytes: jnp.ndarray,
+    queries: jnp.ndarray,
+    *,
+    beta: float = 2.0,
+    periodic: bool = False,
+    box_length: float = 1.0,
 ) -> jnp.ndarray:
     leaf_bytes = jnp.asarray(leaf_bytes, dtype=jnp.uint8)
     node_bytes = jnp.asarray(node_bytes, dtype=jnp.uint8)
@@ -639,13 +660,22 @@ def barnes_hut_force(
 
     if queries.ndim != 2 or queries.shape[1] not in (2, 3):
         raise ValueError("queries must be (M, 2) or (M, 3)")
+    if periodic and box_length <= 0:
+        raise ValueError("box_length must be > 0 when periodic=True")
 
     out_shape = jax.ShapeDtypeStruct((queries.shape[0], queries.shape[1]), jnp.float32)
     target = _TARGET_BH_FORCE if queries.shape[1] == 2 else _TARGET_BH_FORCE_3D
     return jax.ffi.ffi_call(
         target,
         result_shape_dtypes=out_shape,
-    )(leaf_bytes, node_bytes, queries, beta=np.float32(beta))
+    )(
+        leaf_bytes,
+        node_bytes,
+        queries,
+        beta=np.float32(beta),
+        periodic=np.int32(1 if periodic else 0),
+        box_length=np.float32(box_length),
+    )
 
 
 def softened_barnes_hut_force(
@@ -656,6 +686,8 @@ def softened_barnes_hut_force(
     beta: float = 2.0,
     softening_scale: float = 1e-2,
     cutoff_scale: float = 1.0,
+    periodic: bool = False,
+    box_length: float = 1.0,
 ) -> jnp.ndarray:
     leaf_bytes = jnp.asarray(leaf_bytes, dtype=jnp.uint8)
     node_bytes = jnp.asarray(node_bytes, dtype=jnp.uint8)
@@ -667,6 +699,8 @@ def softened_barnes_hut_force(
         raise ValueError("softening_scale must be >= 0")
     if cutoff_scale <= 0:
         raise ValueError("cutoff_scale must be > 0")
+    if periodic and box_length <= 0:
+        raise ValueError("box_length must be > 0 when periodic=True")
 
     out_shape = jax.ShapeDtypeStruct((queries.shape[0], queries.shape[1]), jnp.float32)
     target = _TARGET_BH_FORCE_SOFT if queries.shape[1] == 2 else _TARGET_BH_FORCE_SOFT_3D
@@ -680,6 +714,8 @@ def softened_barnes_hut_force(
         beta=np.float32(beta),
         softening_scale=np.float32(softening_scale),
         cutoff_scale=np.float32(cutoff_scale),
+        periodic=np.int32(1 if periodic else 0),
+        box_length=np.float32(box_length),
     )
 
 
@@ -691,6 +727,8 @@ def stochastic_barnes_hut_gravity(
     *,
     samples_per_subdomain: int = 1,
     seed: int = 0,
+    periodic: bool = False,
+    box_length: float = 1.0,
 ) -> jnp.ndarray:
     leaf_bytes = jnp.asarray(leaf_bytes, dtype=jnp.uint8)
     node_bytes = jnp.asarray(node_bytes, dtype=jnp.uint8)
@@ -699,6 +737,8 @@ def stochastic_barnes_hut_gravity(
 
     if queries.ndim != 2 or queries.shape[1] not in (2, 3):
         raise ValueError("queries must be (M, 2) or (M, 3)")
+    if periodic and box_length <= 0:
+        raise ValueError("box_length must be > 0 when periodic=True")
 
     out_shape = jax.ShapeDtypeStruct((queries.shape[0],), jnp.float32)
     target = _TARGET_SBH if queries.shape[1] == 2 else _TARGET_SBH_3D
@@ -712,6 +752,8 @@ def stochastic_barnes_hut_gravity(
         queries,
         samples_per_subdomain=np.int32(samples_per_subdomain),
         seed=np.int32(seed),
+        periodic=np.int32(1 if periodic else 0),
+        box_length=np.float32(box_length),
     )
 
 
@@ -723,6 +765,8 @@ def stochastic_barnes_hut_force(
     *,
     samples_per_subdomain: int = 1,
     seed: int = 0,
+    periodic: bool = False,
+    box_length: float = 1.0,
 ) -> jnp.ndarray:
     leaf_bytes = jnp.asarray(leaf_bytes, dtype=jnp.uint8)
     node_bytes = jnp.asarray(node_bytes, dtype=jnp.uint8)
@@ -731,6 +775,8 @@ def stochastic_barnes_hut_force(
 
     if queries.ndim != 2 or queries.shape[1] not in (2, 3):
         raise ValueError("queries must be (M, 2) or (M, 3)")
+    if periodic and box_length <= 0:
+        raise ValueError("box_length must be > 0 when periodic=True")
 
     out_shape = jax.ShapeDtypeStruct((queries.shape[0], queries.shape[1]), jnp.float32)
     target = _TARGET_SBH_FORCE if queries.shape[1] == 2 else _TARGET_SBH_FORCE_3D
@@ -744,6 +790,8 @@ def stochastic_barnes_hut_force(
         queries,
         samples_per_subdomain=np.int32(samples_per_subdomain),
         seed=np.int32(seed),
+        periodic=np.int32(1 if periodic else 0),
+        box_length=np.float32(box_length),
     )
 
 
@@ -757,6 +805,8 @@ def softened_stochastic_barnes_hut_force(
     seed: int = 0,
     softening_scale: float = 1e-2,
     cutoff_scale: float = 1.0,
+    periodic: bool = False,
+    box_length: float = 1.0,
 ) -> jnp.ndarray:
     leaf_bytes = jnp.asarray(leaf_bytes, dtype=jnp.uint8)
     node_bytes = jnp.asarray(node_bytes, dtype=jnp.uint8)
@@ -769,6 +819,8 @@ def softened_stochastic_barnes_hut_force(
         raise ValueError("softening_scale must be >= 0")
     if cutoff_scale <= 0:
         raise ValueError("cutoff_scale must be > 0")
+    if periodic and box_length <= 0:
+        raise ValueError("box_length must be > 0 when periodic=True")
 
     out_shape = jax.ShapeDtypeStruct((queries.shape[0], queries.shape[1]), jnp.float32)
     target = _TARGET_SBH_FORCE_SOFT if queries.shape[1] == 2 else _TARGET_SBH_FORCE_SOFT_3D
@@ -784,6 +836,8 @@ def softened_stochastic_barnes_hut_force(
         seed=np.int32(seed),
         softening_scale=np.float32(softening_scale),
         cutoff_scale=np.float32(cutoff_scale),
+        periodic=np.int32(1 if periodic else 0),
+        box_length=np.float32(box_length),
     )
 
 
@@ -793,6 +847,8 @@ def barnes_hut_force_octree8(
     queries: jnp.ndarray,
     *,
     beta: float = 2.0,
+    periodic: bool = False,
+    box_length: float = 1.0,
 ) -> jnp.ndarray:
     leaf_bytes = jnp.asarray(leaf_bytes, dtype=jnp.uint8)
     node_bytes = jnp.asarray(node_bytes, dtype=jnp.uint8)
@@ -800,12 +856,21 @@ def barnes_hut_force_octree8(
 
     if queries.ndim != 2 or queries.shape[1] != 3:
         raise ValueError("queries must be (M, 3)")
+    if periodic and box_length <= 0:
+        raise ValueError("box_length must be > 0 when periodic=True")
 
     out_shape = jax.ShapeDtypeStruct((queries.shape[0], 3), jnp.float32)
     return jax.ffi.ffi_call(
         _TARGET_BH_FORCE_OCTREE8,
         result_shape_dtypes=out_shape,
-    )(leaf_bytes, node_bytes, queries, beta=np.float32(beta))
+    )(
+        leaf_bytes,
+        node_bytes,
+        queries,
+        beta=np.float32(beta),
+        periodic=np.int32(1 if periodic else 0),
+        box_length=np.float32(box_length),
+    )
 
 
 def softened_barnes_hut_force_octree8(
@@ -816,6 +881,8 @@ def softened_barnes_hut_force_octree8(
     beta: float = 2.0,
     softening_scale: float = 1e-2,
     cutoff_scale: float = 1.0,
+    periodic: bool = False,
+    box_length: float = 1.0,
 ) -> jnp.ndarray:
     register_softened_barnes_hut_force_octree8()
 
@@ -829,6 +896,8 @@ def softened_barnes_hut_force_octree8(
         raise ValueError("softening_scale must be >= 0")
     if cutoff_scale <= 0:
         raise ValueError("cutoff_scale must be > 0")
+    if periodic and box_length <= 0:
+        raise ValueError("box_length must be > 0 when periodic=True")
 
     out_shape = jax.ShapeDtypeStruct((queries.shape[0], 3), jnp.float32)
     return jax.ffi.ffi_call(
@@ -841,6 +910,8 @@ def softened_barnes_hut_force_octree8(
         beta=np.float32(beta),
         softening_scale=np.float32(softening_scale),
         cutoff_scale=np.float32(cutoff_scale),
+        periodic=np.int32(1 if periodic else 0),
+        box_length=np.float32(box_length),
     )
 
 
@@ -851,6 +922,8 @@ def stochastic_barnes_hut_force_octree8(
     *,
     samples_per_subdomain: int = 1,
     seed: int = 0,
+    periodic: bool = False,
+    box_length: float = 1.0,
 ) -> jnp.ndarray:
     leaf_bytes = jnp.asarray(leaf_bytes, dtype=jnp.uint8)
     node_bytes = jnp.asarray(node_bytes, dtype=jnp.uint8)
@@ -858,6 +931,8 @@ def stochastic_barnes_hut_force_octree8(
 
     if queries.ndim != 2 or queries.shape[1] != 3:
         raise ValueError("queries must be (M, 3)")
+    if periodic and box_length <= 0:
+        raise ValueError("box_length must be > 0 when periodic=True")
 
     out_shape = jax.ShapeDtypeStruct((queries.shape[0], 3), jnp.float32)
     return jax.ffi.ffi_call(
@@ -869,6 +944,8 @@ def stochastic_barnes_hut_force_octree8(
         queries,
         samples_per_subdomain=np.int32(samples_per_subdomain),
         seed=np.int32(seed),
+        periodic=np.int32(1 if periodic else 0),
+        box_length=np.float32(box_length),
     )
 
 
@@ -881,6 +958,8 @@ def softened_stochastic_barnes_hut_force_octree8(
     seed: int = 0,
     softening_scale: float = 1e-2,
     cutoff_scale: float = 1.0,
+    periodic: bool = False,
+    box_length: float = 1.0,
 ) -> jnp.ndarray:
     leaf_bytes = jnp.asarray(leaf_bytes, dtype=jnp.uint8)
     node_bytes = jnp.asarray(node_bytes, dtype=jnp.uint8)
@@ -892,6 +971,8 @@ def softened_stochastic_barnes_hut_force_octree8(
         raise ValueError("softening_scale must be >= 0")
     if cutoff_scale <= 0:
         raise ValueError("cutoff_scale must be > 0")
+    if periodic and box_length <= 0:
+        raise ValueError("box_length must be > 0 when periodic=True")
 
     out_shape = jax.ShapeDtypeStruct((queries.shape[0], 3), jnp.float32)
     return jax.ffi.ffi_call(
@@ -905,6 +986,8 @@ def softened_stochastic_barnes_hut_force_octree8(
         seed=np.int32(seed),
         softening_scale=np.float32(softening_scale),
         cutoff_scale=np.float32(cutoff_scale),
+        periodic=np.int32(1 if periodic else 0),
+        box_length=np.float32(box_length),
     )
 
 
@@ -917,6 +1000,8 @@ def softened_barnes_hut_force_octree8_vjp(
     beta: float = 2.0,
     softening_scale: float = 1e-2,
     cutoff_scale: float = 1.0,
+    periodic: bool = False,
+    box_length: float = 1.0,
 ) -> jnp.ndarray:
     register_softened_barnes_hut_force_octree8_vjp()
 
@@ -933,6 +1018,8 @@ def softened_barnes_hut_force_octree8_vjp(
         raise ValueError("softening_scale must be >= 0")
     if cutoff_scale <= 0:
         raise ValueError("cutoff_scale must be > 0")
+    if periodic and box_length <= 0:
+        raise ValueError("box_length must be > 0 when periodic=True")
 
     out_shape = jax.ShapeDtypeStruct((queries.shape[0], 3), jnp.float32)
     return jax.ffi.ffi_call(
@@ -946,6 +1033,8 @@ def softened_barnes_hut_force_octree8_vjp(
         beta=np.float32(beta),
         softening_scale=np.float32(softening_scale),
         cutoff_scale=np.float32(cutoff_scale),
+        periodic=np.int32(1 if periodic else 0),
+        box_length=np.float32(box_length),
     )
 
 
@@ -957,6 +1046,8 @@ def _softened_barnes_hut_force_octree8_recompute_vjp_impl(
     softening_scale: float,
     cutoff_scale: float,
     max_depth: int,
+    periodic: int,
+    box_length: float,
 ) -> jnp.ndarray:
     points = jnp.asarray(points, dtype=jnp.float32)
     masses = jnp.asarray(masses, dtype=jnp.float32)
@@ -974,6 +1065,8 @@ def _softened_barnes_hut_force_octree8_recompute_vjp_impl(
         beta=beta,
         softening_scale=softening_scale,
         cutoff_scale=cutoff_scale,
+        periodic=bool(periodic),
+        box_length=box_length,
     )
 
 
@@ -985,7 +1078,11 @@ def softened_barnes_hut_force_octree8_recompute_vjp(
     softening_scale: float = 1e-2,
     cutoff_scale: float = 1.0,
     max_depth: int = 7,
+    periodic: bool = False,
+    box_length: float = 1.0,
 ) -> jnp.ndarray:
+    if periodic and box_length <= 0:
+        raise ValueError("box_length must be > 0 when periodic=True")
     return _softened_barnes_hut_force_octree8_recompute_vjp_impl(
         points,
         masses,
@@ -993,6 +1090,8 @@ def softened_barnes_hut_force_octree8_recompute_vjp(
         np.float32(softening_scale),
         np.float32(cutoff_scale),
         np.int32(max_depth),
+        np.int32(1 if periodic else 0),
+        np.float32(box_length),
     )
 
 
@@ -1003,6 +1102,8 @@ def _softened_barnes_hut_force_octree8_recompute_vjp_fwd(
     softening_scale: float,
     cutoff_scale: float,
     max_depth: int,
+    periodic: int,
+    box_length: float,
 ):
     points = jnp.asarray(points, dtype=jnp.float32)
     masses = jnp.asarray(masses, dtype=jnp.float32)
@@ -1020,13 +1121,24 @@ def _softened_barnes_hut_force_octree8_recompute_vjp_fwd(
         beta=beta,
         softening_scale=softening_scale,
         cutoff_scale=cutoff_scale,
+        periodic=bool(periodic),
+        box_length=box_length,
     )
-    residual = (points, masses, float(beta), float(softening_scale), float(cutoff_scale), int(max_depth))
+    residual = (
+        points,
+        masses,
+        float(beta),
+        float(softening_scale),
+        float(cutoff_scale),
+        int(max_depth),
+        int(periodic),
+        float(box_length),
+    )
     return out, residual
 
 
 def _softened_barnes_hut_force_octree8_recompute_vjp_bwd(residual, cotangent):
-    points, masses, beta, softening_scale, cutoff_scale, max_depth = residual
+    points, masses, beta, softening_scale, cutoff_scale, max_depth, periodic, box_length = residual
     normals = jnp.zeros_like(points)
     leaf_bytes, node_bytes = build_octree8_buffers(
         points,
@@ -1042,9 +1154,11 @@ def _softened_barnes_hut_force_octree8_recompute_vjp_bwd(residual, cotangent):
         beta=beta,
         softening_scale=softening_scale,
         cutoff_scale=cutoff_scale,
+        periodic=bool(periodic),
+        box_length=box_length,
     )
     grad_masses = jnp.zeros_like(masses)
-    return (grad_points, grad_masses, None, None, None, None)
+    return (grad_points, grad_masses, None, None, None, None, None, None)
 
 
 _softened_barnes_hut_force_octree8_recompute_vjp_impl.defvjp(

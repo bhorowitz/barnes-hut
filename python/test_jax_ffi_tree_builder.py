@@ -143,7 +143,52 @@ def test_octree8_builder_ffi_chain_3d():
     np.testing.assert_allclose(np.isfinite(np.asarray(force_sbh_soft)).all(), True)
 
 
+def test_octree8_periodic_minimum_image_shift_invariance():
+    jax_sbh_ffi.register_build_octree8_buffers()
+    jax_sbh_ffi.register_barnes_hut_force_octree8()
+
+    key = jax.random.PRNGKey(3)
+    n = 192
+    box_length = 2.0
+    points = jax.random.uniform(
+        key, (n, 3), minval=0.0, maxval=box_length, dtype=jnp.float32
+    )
+    normals = jnp.zeros_like(points)
+    masses = jnp.ones((n,), dtype=jnp.float32)
+    min_corner = jnp.array([0.0, 0.0, 0.0], dtype=jnp.float32)
+    max_corner = jnp.array([box_length, box_length, box_length], dtype=jnp.float32)
+    leaf_bytes, node_bytes = jax_sbh_ffi.build_octree8_buffers(
+        points,
+        normals,
+        masses,
+        min_corner=min_corner,
+        max_corner=max_corner,
+        max_depth=5,
+    )
+
+    queries = points[:32]
+    queries_shift = queries + jnp.array([box_length, 0.0, 0.0], dtype=jnp.float32)
+    force0 = jax_sbh_ffi.barnes_hut_force_octree8(
+        leaf_bytes,
+        node_bytes,
+        queries,
+        beta=1.8,
+        periodic=True,
+        box_length=box_length,
+    )
+    force1 = jax_sbh_ffi.barnes_hut_force_octree8(
+        leaf_bytes,
+        node_bytes,
+        queries_shift,
+        beta=1.8,
+        periodic=True,
+        box_length=box_length,
+    )
+    np.testing.assert_allclose(np.asarray(force0), np.asarray(force1), rtol=1e-4, atol=1e-4)
+
+
 if __name__ == "__main__":
     test_octree_builder_ffi_chain_3d()
     test_octree8_builder_ffi_chain_3d()
+    test_octree8_periodic_minimum_image_shift_invariance()
     print("OK")

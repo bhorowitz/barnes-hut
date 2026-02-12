@@ -31,6 +31,9 @@ using F32R2Out = xla::ffi::ResultBuffer<xla::ffi::F32, 2>;
 using U8R1 = xla::ffi::Buffer<xla::ffi::U8, 1>;
 using U8R1Out = xla::ffi::ResultBuffer<xla::ffi::U8, 1>;
 
+inline cudaError_t SetPeriodicBox(cudaStream_t stream, int periodic,
+                                  float box_length);
+
 static constexpr int kOctreeDimSplit = 8;
 static constexpr int kOctreeNumBins =
     kOctreeDimSplit * kOctreeDimSplit * kOctreeDimSplit;
@@ -118,15 +121,19 @@ static_assert(sizeof(Node3Layout) == sizeof(Node3),
 template <int N>
 __device__ VectorNd<N> gravityGradSoftCutoff(const LeafData<N>& data,
                                              VectorNd<N> q) {
-  VectorNd<N> dvec = q - data.position;
+  VectorNd<N> dvec = minImageDisplacement<N>(q - data.position);
   float dist_sq = dvec.squaredNorm();
   float eps = fmaxf(g_softening_scale, 0.0f);
   float inv_r = rsqrtf(dist_sq + eps * eps + 1e-12f);
   float inv_r3 = inv_r * inv_r * inv_r;
-  float attenuation = 1.0f;
+  float attenuation = 1.0f;  // Short-range force factor.
   if (g_cutoff_scale > 0.0f) {
+    // Match JaxPM's long-range split exp(-k^2 r_split^2):
+    // F_short/F_newton = erfc(u) + 2u/sqrt(pi) * exp(-u^2), u=r/(2 r_split)
     float dist = sqrtf(dist_sq + 1e-12f);
-    attenuation = expf(-dist / g_cutoff_scale);
+    float u = dist / (2.0f * g_cutoff_scale);
+    float exp_u2 = expf(-(u * u));
+    attenuation = erfcf(u) + (2.0f / 1.772453850905516f) * u * exp_u2;
   }
   return -data.mass * attenuation * inv_r3 * dvec;
 }
@@ -1581,9 +1588,14 @@ __device__ __forceinline__ bool octree8_use_far_field(
   if (node.is_leaf) {
     return true;
   }
-  float dx = q(0) - node.cx;
-  float dy = q(1) - node.cy;
-  float dz = q(2) - node.cz;
+  VectorNd<3> dc;
+  dc(0) = q(0) - node.cx;
+  dc(1) = q(1) - node.cy;
+  dc(2) = q(2) - node.cz;
+  dc = minImageDisplacement<3>(dc);
+  float dx = dc(0);
+  float dy = dc(1);
+  float dz = dc(2);
   float dist = sqrtf(dx * dx + dy * dy + dz * dz);
   return dist / node.diameter >= beta;
 }
@@ -1688,7 +1700,7 @@ __global__ void barnes_hut_force_octree8_soft_kernel(
 
 __device__ __forceinline__ VectorNd<3> gravityGradSoftCutoffVjp(
     const Leaf3& data, VectorNd<3> q, VectorNd<3> g) {
-  VectorNd<3> r = q - data.position;
+  VectorNd<3> r = minImageDisplacement<3>(q - data.position);
   float r2 = r.squaredNorm();
   float eps = fmaxf(g_softening_scale, 0.0f);
   float inv_r = rsqrtf(r2 + eps * eps + 1e-12f);
@@ -1698,12 +1710,21 @@ __device__ __forceinline__ VectorNd<3> gravityGradSoftCutoffVjp(
   float cutoff_coeff = 0.0f;
   if (g_cutoff_scale > 0.0f) {
     float dist = sqrtf(r2 + 1e-12f);
-    attenuation = expf(-dist / g_cutoff_scale);
-    cutoff_coeff = inv_r3 / (g_cutoff_scale * dist);
+    float u = dist / (2.0f * g_cutoff_scale);
+    float exp_u2 = expf(-(u * u));
+    attenuation = erfcf(u) + (2.0f / 1.772453850905516f) * u * exp_u2;
+    // For J^T g of f(r)= -m * attenuation(r) * inv_r3 * r:
+    // use coefficient 3*attenuation*inv_r5 - inv_r3 * attenuation'(r)/r.
+    // Here attenuation'(r)/r = -exp(-u^2) / (2 sqrt(pi) r_split^3) * r.
+    cutoff_coeff =
+        inv_r3 * dist * exp_u2 /
+        (2.0f * 1.772453850905516f * g_cutoff_scale * g_cutoff_scale *
+         g_cutoff_scale);
   }
   float rg = r.dot(g);
-  VectorNd<3> grad = inv_r3 * g - rg * (3.0f * inv_r5 + cutoff_coeff) * r;
-  return -data.mass * attenuation * grad;
+  VectorNd<3> grad = attenuation * inv_r3 * g -
+                     rg * (3.0f * attenuation * inv_r5 + cutoff_coeff) * r;
+  return -data.mass * grad;
 }
 
 __global__ void barnes_hut_force_octree8_soft_vjp_kernel(
@@ -1805,9 +1826,13 @@ __global__ void stochastic_bh_force_octree8_kernel(
       const OctreeNode8* cur_node = &sub;
       float event_prob = 1.0f;
       VectorNd<3> weighted_diff_all = VectorNd<3>::Zero();
-      float cur_beta = fmaxf(1.0f, (float)((qv - VectorNd<3>(cur_node->cx, cur_node->cy, cur_node->cz)).norm() / cur_node->diameter));
+      VectorNd<3> dcur = qv - VectorNd<3>(cur_node->cx, cur_node->cy, cur_node->cz);
+      dcur = minImageDisplacement<3>(dcur);
+      float cur_beta = fmaxf(1.0f, (float)(dcur.norm() / cur_node->diameter));
       while (!cur_node->is_leaf) {
-        float dist = (qv - VectorNd<3>(cur_node->cx, cur_node->cy, cur_node->cz)).norm();
+        VectorNd<3> dnode = qv - VectorNd<3>(cur_node->cx, cur_node->cy, cur_node->cz);
+        dnode = minImageDisplacement<3>(dnode);
+        float dist = dnode.norm();
         float far_field_ratio = dist / cur_node->diameter;
         float traverse_prob = fminf(cur_beta / far_field_ratio, 1.0f);
         float p = curand_uniform(&s);
@@ -1869,7 +1894,9 @@ xla::ffi::Error BarnesHutGravity(cudaStream_t stream,
                                  U8R1 node_bytes,
                                  F32R2 queries,
                                  F32R1Out out,
-                                 float beta) {
+                                 float beta,
+                                 int periodic,
+                                 float box_length) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf2) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -1880,6 +1907,11 @@ xla::ffi::Error BarnesHutGravity(cudaStream_t stream,
   int num_queries = static_cast<int>(queries.dimensions()[0]);
   if (queries.dimensions()[1] != 2) {
     return xla::ffi::Error::InvalidArgument("queries dim must be 2");
+  }
+
+  cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
+  if (per_err != cudaSuccess) {
+    return xla::ffi::Error::Internal(cudaGetErrorString(per_err));
   }
 
   const Leaf2* leaf_data = reinterpret_cast<const Leaf2*>(leaf_bytes.untyped_data());
@@ -1905,7 +1937,9 @@ xla::ffi::Error BarnesHutGravity3D(cudaStream_t stream,
                                    U8R1 node_bytes,
                                    F32R2 queries,
                                    F32R1Out out,
-                                   float beta) {
+                                   float beta,
+                                   int periodic,
+                                   float box_length) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf3) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -1916,6 +1950,11 @@ xla::ffi::Error BarnesHutGravity3D(cudaStream_t stream,
   int num_queries = static_cast<int>(queries.dimensions()[0]);
   if (queries.dimensions()[1] != 3) {
     return xla::ffi::Error::InvalidArgument("queries dim must be 3");
+  }
+
+  cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
+  if (per_err != cudaSuccess) {
+    return xla::ffi::Error::Internal(cudaGetErrorString(per_err));
   }
 
   const Leaf3* leaf_data = reinterpret_cast<const Leaf3*>(leaf_bytes.untyped_data());
@@ -1949,12 +1988,28 @@ inline cudaError_t SetSofteningCutoff(cudaStream_t stream, float softening,
   return err;
 }
 
+inline cudaError_t SetPeriodicBox(cudaStream_t stream, int periodic,
+                                  float box_length) {
+  cudaError_t err = cudaMemcpyToSymbolAsync(
+      g_periodic_min_image, &periodic, sizeof(int), 0, cudaMemcpyHostToDevice,
+      stream);
+  if (err != cudaSuccess) {
+    return err;
+  }
+  err = cudaMemcpyToSymbolAsync(
+      g_periodic_box_length, &box_length, sizeof(float), 0,
+      cudaMemcpyHostToDevice, stream);
+  return err;
+}
+
 xla::ffi::Error BarnesHutForce(cudaStream_t stream,
                                U8R1 leaf_bytes,
                                U8R1 node_bytes,
                                F32R2 queries,
                                F32R2Out out,
-                               float beta) {
+                               float beta,
+                               int periodic,
+                               float box_length) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf2) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -1969,6 +2024,11 @@ xla::ffi::Error BarnesHutForce(cudaStream_t stream,
   auto out_dims = out->dimensions();
   if (out_dims[0] != num_queries || out_dims[1] != 2) {
     return xla::ffi::Error::InvalidArgument("out shape mismatch");
+  }
+
+  cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
+  if (per_err != cudaSuccess) {
+    return xla::ffi::Error::Internal(cudaGetErrorString(per_err));
   }
 
   const Leaf2* leaf_data = reinterpret_cast<const Leaf2*>(leaf_bytes.untyped_data());
@@ -1996,7 +2056,9 @@ xla::ffi::Error SoftenedBarnesHutForce(cudaStream_t stream,
                                        F32R2Out out,
                                        float beta,
                                        float softening_scale,
-                                       float cutoff_scale) {
+                                       float cutoff_scale,
+                                       int periodic,
+                                       float box_length) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf2) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -2011,6 +2073,11 @@ xla::ffi::Error SoftenedBarnesHutForce(cudaStream_t stream,
   auto out_dims = out->dimensions();
   if (out_dims[0] != num_queries || out_dims[1] != 2) {
     return xla::ffi::Error::InvalidArgument("out shape mismatch");
+  }
+
+  cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
+  if (per_err != cudaSuccess) {
+    return xla::ffi::Error::Internal(cudaGetErrorString(per_err));
   }
 
   cudaError_t set_err = SetSofteningCutoff(stream, softening_scale, cutoff_scale);
@@ -2044,7 +2111,9 @@ xla::ffi::Error SoftenedBarnesHutForce3D(cudaStream_t stream,
                                          F32R2Out out,
                                          float beta,
                                          float softening_scale,
-                                         float cutoff_scale) {
+                                         float cutoff_scale,
+                                         int periodic,
+                                         float box_length) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf3) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -2059,6 +2128,11 @@ xla::ffi::Error SoftenedBarnesHutForce3D(cudaStream_t stream,
   auto out_dims = out->dimensions();
   if (out_dims[0] != num_queries || out_dims[1] != 3) {
     return xla::ffi::Error::InvalidArgument("out shape mismatch");
+  }
+
+  cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
+  if (per_err != cudaSuccess) {
+    return xla::ffi::Error::Internal(cudaGetErrorString(per_err));
   }
 
   cudaError_t set_err = SetSofteningCutoff(stream, softening_scale, cutoff_scale);
@@ -2090,7 +2164,9 @@ xla::ffi::Error BarnesHutForce3D(cudaStream_t stream,
                                  U8R1 node_bytes,
                                  F32R2 queries,
                                  F32R2Out out,
-                                 float beta) {
+                                 float beta,
+                                 int periodic,
+                                 float box_length) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf3) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -2105,6 +2181,11 @@ xla::ffi::Error BarnesHutForce3D(cudaStream_t stream,
   auto out_dims = out->dimensions();
   if (out_dims[0] != num_queries || out_dims[1] != 3) {
     return xla::ffi::Error::InvalidArgument("out shape mismatch");
+  }
+
+  cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
+  if (per_err != cudaSuccess) {
+    return xla::ffi::Error::Internal(cudaGetErrorString(per_err));
   }
 
   const Leaf3* leaf_data = reinterpret_cast<const Leaf3*>(leaf_bytes.untyped_data());
@@ -2132,7 +2213,9 @@ xla::ffi::Error StochasticBarnesHutGravity(cudaStream_t stream,
                                            F32R2 queries,
                                            F32R1Out out,
                                            int samples_per_subdomain,
-                                           int seed) {
+                                           int seed,
+                                           int periodic,
+                                           float box_length) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf2) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -2146,6 +2229,11 @@ xla::ffi::Error StochasticBarnesHutGravity(cudaStream_t stream,
   int num_queries = static_cast<int>(queries.dimensions()[0]);
   if (queries.dimensions()[1] != 2) {
     return xla::ffi::Error::InvalidArgument("queries dim must be 2");
+  }
+
+  cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
+  if (per_err != cudaSuccess) {
+    return xla::ffi::Error::Internal(cudaGetErrorString(per_err));
   }
 
   int num_points = static_cast<int>(leaf_bytes.size_bytes() / sizeof(Leaf2));
@@ -2177,7 +2265,9 @@ xla::ffi::Error StochasticBarnesHutGravity3D(cudaStream_t stream,
                                              F32R2 queries,
                                              F32R1Out out,
                                              int samples_per_subdomain,
-                                             int seed) {
+                                             int seed,
+                                             int periodic,
+                                             float box_length) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf3) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -2191,6 +2281,11 @@ xla::ffi::Error StochasticBarnesHutGravity3D(cudaStream_t stream,
   int num_queries = static_cast<int>(queries.dimensions()[0]);
   if (queries.dimensions()[1] != 3) {
     return xla::ffi::Error::InvalidArgument("queries dim must be 3");
+  }
+
+  cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
+  if (per_err != cudaSuccess) {
+    return xla::ffi::Error::Internal(cudaGetErrorString(per_err));
   }
 
   int num_points = static_cast<int>(leaf_bytes.size_bytes() / sizeof(Leaf3));
@@ -2222,7 +2317,9 @@ xla::ffi::Error StochasticBarnesHutForce(cudaStream_t stream,
                                          F32R2 queries,
                                          F32R2Out out,
                                          int samples_per_subdomain,
-                                         int seed) {
+                                         int seed,
+                                         int periodic,
+                                         float box_length) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf2) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -2236,6 +2333,11 @@ xla::ffi::Error StochasticBarnesHutForce(cudaStream_t stream,
   int num_queries = static_cast<int>(queries.dimensions()[0]);
   if (queries.dimensions()[1] != 2) {
     return xla::ffi::Error::InvalidArgument("queries dim must be 2");
+  }
+
+  cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
+  if (per_err != cudaSuccess) {
+    return xla::ffi::Error::Internal(cudaGetErrorString(per_err));
   }
 
   int num_points = static_cast<int>(leaf_bytes.size_bytes() / sizeof(Leaf2));
@@ -2267,7 +2369,9 @@ xla::ffi::Error StochasticBarnesHutForce3D(cudaStream_t stream,
                                            F32R2 queries,
                                            F32R2Out out,
                                            int samples_per_subdomain,
-                                           int seed) {
+                                           int seed,
+                                           int periodic,
+                                           float box_length) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf3) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -2281,6 +2385,11 @@ xla::ffi::Error StochasticBarnesHutForce3D(cudaStream_t stream,
   int num_queries = static_cast<int>(queries.dimensions()[0]);
   if (queries.dimensions()[1] != 3) {
     return xla::ffi::Error::InvalidArgument("queries dim must be 3");
+  }
+
+  cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
+  if (per_err != cudaSuccess) {
+    return xla::ffi::Error::Internal(cudaGetErrorString(per_err));
   }
 
   int num_points = static_cast<int>(leaf_bytes.size_bytes() / sizeof(Leaf3));
@@ -2314,7 +2423,9 @@ xla::ffi::Error SoftenedStochasticBarnesHutForce(cudaStream_t stream,
                                                  int samples_per_subdomain,
                                                  int seed,
                                                  float softening_scale,
-                                                 float cutoff_scale) {
+                                                 float cutoff_scale,
+                                                 int periodic,
+                                                 float box_length) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf2) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -2332,6 +2443,11 @@ xla::ffi::Error SoftenedStochasticBarnesHutForce(cudaStream_t stream,
   auto out_dims = out->dimensions();
   if (out_dims[0] != num_queries || out_dims[1] != 2) {
     return xla::ffi::Error::InvalidArgument("out shape mismatch");
+  }
+
+  cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
+  if (per_err != cudaSuccess) {
+    return xla::ffi::Error::Internal(cudaGetErrorString(per_err));
   }
 
   cudaError_t set_err = SetSofteningCutoff(stream, softening_scale, cutoff_scale);
@@ -2371,7 +2487,9 @@ xla::ffi::Error SoftenedStochasticBarnesHutForce3D(cudaStream_t stream,
                                                    int samples_per_subdomain,
                                                    int seed,
                                                    float softening_scale,
-                                                   float cutoff_scale) {
+                                                   float cutoff_scale,
+                                                   int periodic,
+                                                   float box_length) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf3) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -2389,6 +2507,11 @@ xla::ffi::Error SoftenedStochasticBarnesHutForce3D(cudaStream_t stream,
   auto out_dims = out->dimensions();
   if (out_dims[0] != num_queries || out_dims[1] != 3) {
     return xla::ffi::Error::InvalidArgument("out shape mismatch");
+  }
+
+  cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
+  if (per_err != cudaSuccess) {
+    return xla::ffi::Error::Internal(cudaGetErrorString(per_err));
   }
 
   cudaError_t set_err = SetSofteningCutoff(stream, softening_scale, cutoff_scale);
@@ -2424,7 +2547,9 @@ xla::ffi::Error BarnesHutForceOctree8(cudaStream_t stream,
                                       U8R1 node_bytes,
                                       F32R2 queries,
                                       F32R2Out out,
-                                      float beta) {
+                                      float beta,
+                                      int periodic,
+                                      float box_length) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf3) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -2438,6 +2563,11 @@ xla::ffi::Error BarnesHutForceOctree8(cudaStream_t stream,
   auto out_dims = out->dimensions();
   if (out_dims[0] != num_queries || out_dims[1] != 3) {
     return xla::ffi::Error::InvalidArgument("out shape mismatch");
+  }
+
+  cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
+  if (per_err != cudaSuccess) {
+    return xla::ffi::Error::Internal(cudaGetErrorString(per_err));
   }
 
   const Leaf3* leaf_data =
@@ -2466,7 +2596,9 @@ xla::ffi::Error SoftenedBarnesHutForceOctree8(cudaStream_t stream,
                                               F32R2Out out,
                                               float beta,
                                               float softening_scale,
-                                              float cutoff_scale) {
+                                              float cutoff_scale,
+                                              int periodic,
+                                              float box_length) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf3) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -2480,6 +2612,11 @@ xla::ffi::Error SoftenedBarnesHutForceOctree8(cudaStream_t stream,
   auto out_dims = out->dimensions();
   if (out_dims[0] != num_queries || out_dims[1] != 3) {
     return xla::ffi::Error::InvalidArgument("out shape mismatch");
+  }
+
+  cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
+  if (per_err != cudaSuccess) {
+    return xla::ffi::Error::Internal(cudaGetErrorString(per_err));
   }
 
   cudaError_t set_err = SetSofteningCutoff(stream, softening_scale, cutoff_scale);
@@ -2514,7 +2651,9 @@ xla::ffi::Error SoftenedBarnesHutForceOctree8Vjp(cudaStream_t stream,
                                                  F32R2Out out,
                                                  float beta,
                                                  float softening_scale,
-                                                 float cutoff_scale) {
+                                                 float cutoff_scale,
+                                                 int periodic,
+                                                 float box_length) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf3) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -2531,6 +2670,11 @@ xla::ffi::Error SoftenedBarnesHutForceOctree8Vjp(cudaStream_t stream,
   auto out_dims = out->dimensions();
   if (out_dims[0] != num_queries || out_dims[1] != 3) {
     return xla::ffi::Error::InvalidArgument("out shape mismatch");
+  }
+
+  cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
+  if (per_err != cudaSuccess) {
+    return xla::ffi::Error::Internal(cudaGetErrorString(per_err));
   }
 
   cudaError_t set_err = SetSofteningCutoff(stream, softening_scale, cutoff_scale);
@@ -2564,7 +2708,9 @@ xla::ffi::Error StochasticBarnesHutForceOctree8(cudaStream_t stream,
                                                 F32R2 queries,
                                                 F32R2Out out,
                                                 int samples_per_subdomain,
-                                                int seed) {
+                                                int seed,
+                                                int periodic,
+                                                float box_length) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf3) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -2578,6 +2724,11 @@ xla::ffi::Error StochasticBarnesHutForceOctree8(cudaStream_t stream,
   auto out_dims = out->dimensions();
   if (out_dims[0] != num_queries || out_dims[1] != 3) {
     return xla::ffi::Error::InvalidArgument("out shape mismatch");
+  }
+
+  cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
+  if (per_err != cudaSuccess) {
+    return xla::ffi::Error::Internal(cudaGetErrorString(per_err));
   }
 
   const Leaf3* leaf_data =
@@ -2609,7 +2760,9 @@ xla::ffi::Error SoftenedStochasticBarnesHutForceOctree8(
     int samples_per_subdomain,
     int seed,
     float softening_scale,
-    float cutoff_scale) {
+    float cutoff_scale,
+    int periodic,
+    float box_length) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf3) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -2623,6 +2776,11 @@ xla::ffi::Error SoftenedStochasticBarnesHutForceOctree8(
   auto out_dims = out->dimensions();
   if (out_dims[0] != num_queries || out_dims[1] != 3) {
     return xla::ffi::Error::InvalidArgument("out shape mismatch");
+  }
+
+  cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
+  if (per_err != cudaSuccess) {
+    return xla::ffi::Error::Internal(cudaGetErrorString(per_err));
   }
 
   cudaError_t set_err = SetSofteningCutoff(stream, softening_scale, cutoff_scale);
@@ -2696,7 +2854,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<sbh_ffi::U8R1>()
         .Arg<sbh_ffi::F32R2>()
         .Ret<sbh_ffi::F32R1>()
-        .Attr<float>("beta"));
+        .Attr<float>("beta")
+        .Attr<int>("periodic")
+        .Attr<float>("box_length"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_barnes_hut_force_ffi, sbh_ffi::BarnesHutForce,
@@ -2706,7 +2866,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<sbh_ffi::U8R1>()
         .Arg<sbh_ffi::F32R2>()
         .Ret<sbh_ffi::F32R2>()
-        .Attr<float>("beta"));
+        .Attr<float>("beta")
+        .Attr<int>("periodic")
+        .Attr<float>("box_length"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_barnes_hut_gravity_ffi_3d, sbh_ffi::BarnesHutGravity3D,
@@ -2716,7 +2878,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<sbh_ffi::U8R1>()
         .Arg<sbh_ffi::F32R2>()
         .Ret<sbh_ffi::F32R1>()
-        .Attr<float>("beta"));
+        .Attr<float>("beta")
+        .Attr<int>("periodic")
+        .Attr<float>("box_length"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_barnes_hut_force_ffi_3d, sbh_ffi::BarnesHutForce3D,
@@ -2726,7 +2890,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<sbh_ffi::U8R1>()
         .Arg<sbh_ffi::F32R2>()
         .Ret<sbh_ffi::F32R2>()
-        .Attr<float>("beta"));
+        .Attr<float>("beta")
+        .Attr<int>("periodic")
+        .Attr<float>("box_length"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_barnes_hut_force_octree8_ffi, sbh_ffi::BarnesHutForceOctree8,
@@ -2736,7 +2902,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<sbh_ffi::U8R1>()
         .Arg<sbh_ffi::F32R2>()
         .Ret<sbh_ffi::F32R2>()
-        .Attr<float>("beta"));
+        .Attr<float>("beta")
+        .Attr<int>("periodic")
+        .Attr<float>("box_length"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_barnes_hut_force_octree8_soft_ffi,
@@ -2749,7 +2917,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<sbh_ffi::F32R2>()
         .Attr<float>("beta")
         .Attr<float>("softening_scale")
-        .Attr<float>("cutoff_scale"));
+        .Attr<float>("cutoff_scale")
+        .Attr<int>("periodic")
+        .Attr<float>("box_length"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_barnes_hut_force_octree8_soft_vjp_ffi,
@@ -2763,7 +2933,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<sbh_ffi::F32R2>()
         .Attr<float>("beta")
         .Attr<float>("softening_scale")
-        .Attr<float>("cutoff_scale"));
+        .Attr<float>("cutoff_scale")
+        .Attr<int>("periodic")
+        .Attr<float>("box_length"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_barnes_hut_force_soft_ffi, sbh_ffi::SoftenedBarnesHutForce,
@@ -2775,7 +2947,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<sbh_ffi::F32R2>()
         .Attr<float>("beta")
         .Attr<float>("softening_scale")
-        .Attr<float>("cutoff_scale"));
+        .Attr<float>("cutoff_scale")
+        .Attr<int>("periodic")
+        .Attr<float>("box_length"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_barnes_hut_force_soft_ffi_3d, sbh_ffi::SoftenedBarnesHutForce3D,
@@ -2787,7 +2961,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<sbh_ffi::F32R2>()
         .Attr<float>("beta")
         .Attr<float>("softening_scale")
-        .Attr<float>("cutoff_scale"));
+        .Attr<float>("cutoff_scale")
+        .Attr<int>("periodic")
+        .Attr<float>("box_length"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_stochastic_bh_gravity_ffi, sbh_ffi::StochasticBarnesHutGravity,
@@ -2799,7 +2975,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<sbh_ffi::F32R2>()
         .Ret<sbh_ffi::F32R1>()
         .Attr<int>("samples_per_subdomain")
-        .Attr<int>("seed"));
+        .Attr<int>("seed")
+        .Attr<int>("periodic")
+        .Attr<float>("box_length"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_stochastic_bh_gravity_ffi_3d, sbh_ffi::StochasticBarnesHutGravity3D,
@@ -2811,7 +2989,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<sbh_ffi::F32R2>()
         .Ret<sbh_ffi::F32R1>()
         .Attr<int>("samples_per_subdomain")
-        .Attr<int>("seed"));
+        .Attr<int>("seed")
+        .Attr<int>("periodic")
+        .Attr<float>("box_length"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_stochastic_bh_force_ffi, sbh_ffi::StochasticBarnesHutForce,
@@ -2823,7 +3003,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<sbh_ffi::F32R2>()
         .Ret<sbh_ffi::F32R2>()
         .Attr<int>("samples_per_subdomain")
-        .Attr<int>("seed"));
+        .Attr<int>("seed")
+        .Attr<int>("periodic")
+        .Attr<float>("box_length"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_stochastic_bh_force_ffi_3d, sbh_ffi::StochasticBarnesHutForce3D,
@@ -2835,7 +3017,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<sbh_ffi::F32R2>()
         .Ret<sbh_ffi::F32R2>()
         .Attr<int>("samples_per_subdomain")
-        .Attr<int>("seed"));
+        .Attr<int>("seed")
+        .Attr<int>("periodic")
+        .Attr<float>("box_length"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_stochastic_bh_force_octree8_ffi,
@@ -2847,7 +3031,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<sbh_ffi::F32R2>()
         .Ret<sbh_ffi::F32R2>()
         .Attr<int>("samples_per_subdomain")
-        .Attr<int>("seed"));
+        .Attr<int>("seed")
+        .Attr<int>("periodic")
+        .Attr<float>("box_length"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_stochastic_bh_force_octree8_soft_ffi,
@@ -2861,7 +3047,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int>("samples_per_subdomain")
         .Attr<int>("seed")
         .Attr<float>("softening_scale")
-        .Attr<float>("cutoff_scale"));
+        .Attr<float>("cutoff_scale")
+        .Attr<int>("periodic")
+        .Attr<float>("box_length"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_stochastic_bh_force_soft_ffi, sbh_ffi::SoftenedStochasticBarnesHutForce,
@@ -2875,7 +3063,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int>("samples_per_subdomain")
         .Attr<int>("seed")
         .Attr<float>("softening_scale")
-        .Attr<float>("cutoff_scale"));
+        .Attr<float>("cutoff_scale")
+        .Attr<int>("periodic")
+        .Attr<float>("box_length"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_stochastic_bh_force_soft_ffi_3d,
@@ -2890,7 +3080,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int>("samples_per_subdomain")
         .Attr<int>("seed")
         .Attr<float>("softening_scale")
-        .Attr<float>("cutoff_scale"));
+        .Attr<float>("cutoff_scale")
+        .Attr<int>("periodic")
+        .Attr<float>("box_length"));
 
 extern "C" size_t sbh_leaf3_size() {
   return sizeof(sbh_ffi::Leaf3);
