@@ -258,6 +258,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, np.ndarray | float]:
         raise RuntimeError("GPU backend is required.")
 
     jax_sbh_ffi.register_build_octree8_buffers()
+    
     jax_sbh_ffi.register_softened_barnes_hut_force_octree8()
     jax_sbh_ffi.register_softened_barnes_hut_force_octree8_vjp()
 

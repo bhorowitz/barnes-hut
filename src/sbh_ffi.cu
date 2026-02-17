@@ -395,6 +395,9 @@ __global__ void brute_force_gravity_kernel(const float* points,
     float dist_sq = 0.0f;
     for (int d = 0; d < dim; ++d) {
       float diff = p_ptr[d] - q_ptr[d];
+      if (g_periodic_min_image != 0 && g_periodic_box_length > 0.0f) {
+        diff -= g_periodic_box_length * nearbyintf(diff / g_periodic_box_length);
+      }
       dist_sq += diff * diff;
     }
     float dist = sqrtf(dist_sq);
@@ -408,7 +411,10 @@ xla::ffi::Error BruteForceGravity(cudaStream_t stream,
                                   F32R2 points,
                                   F32R1 masses,
                                   F32R2 queries,
-                                  F32R1Out out) {
+                                  F32R1Out out,
+                                  int periodic,
+                                  float box_length,
+                                  int threads) {
   auto points_dims = points.dimensions();
   auto queries_dims = queries.dimensions();
   if (points_dims.size() != 2 || queries_dims.size() != 2) {
@@ -426,13 +432,20 @@ xla::ffi::Error BruteForceGravity(cudaStream_t stream,
   if (dim != 2 && dim != 3) {
     return xla::ffi::Error::InvalidArgument("only dim=2 or dim=3 supported");
   }
+  if (threads <= 0 || threads > 1024) {
+    return xla::ffi::Error::InvalidArgument("threads must be in [1, 1024]");
+  }
+
+  cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
+  if (per_err != cudaSuccess) {
+    return xla::ffi::Error::Internal(cudaGetErrorString(per_err));
+  }
 
   const float* points_ptr = points.typed_data();
   const float* masses_ptr = masses.typed_data();
   const float* queries_ptr = queries.typed_data();
   float* out_ptr = out->typed_data();
 
-  int threads = 64;
   int blocks = (num_queries + threads - 1) / threads;
   brute_force_gravity_kernel<<<blocks, threads, 0, stream>>>(
       points_ptr, masses_ptr, queries_ptr, num_points, num_queries, dim,
@@ -1529,11 +1542,16 @@ __global__ void octree8_build_nodes_kernel(
   node.start = leaf_offsets[first_leaf];
   node.end = node.start + count;
 
-  // center and size
+  // Decode Morton prefix bits to per-axis integer coordinates at this level.
   int grid = 1 << level;
-  int ix = idx & (grid - 1);
-  int iy = (idx >> level) & (grid - 1);
-  int iz = (idx >> (2 * level)) & (grid - 1);
+  int ix = 0;
+  int iy = 0;
+  int iz = 0;
+  for (int b = 0; b < level; b++) {
+    ix |= ((idx >> (3 * b + 0)) & 1) << b;
+    iy |= ((idx >> (3 * b + 1)) & 1) << b;
+    iz |= ((idx >> (3 * b + 2)) & 1) << b;
+  }
   float step = half_size * 2.0f / static_cast<float>(grid);
   node.cx = (cx - half_size) + (static_cast<float>(ix) + 0.5f) * step;
   node.cy = (cy - half_size) + (static_cast<float>(iy) + 0.5f) * step;
@@ -1790,19 +1808,43 @@ __global__ void stochastic_bh_force_octree8_kernel(
   qv(1) = queries[q * 3 + 1];
   qv(2) = queries[q * 3 + 2];
 
-  const OctreeNode8& root = nodes[0];
   VectorNd<3> total = VectorNd<3>::Zero();
   curandState s;
   curandState s2;
   curand_init(seed + q, 0, 0, &s);
-  curand_init(blockIdx.x, 0, 0, &s2);
+  curand_init(seed + q + 0x9e3779b9, 0, 0, &s2);
 
-  uint8_t root_mask = root.child_mask;
-  for (int c = 0; c < 8; c++) {
-    if (!(root_mask & (1u << c))) {
+  // Use depth-3 (or shallower if tree ends earlier) subdomains for control
+  // variates, matching the effective granularity of the level-3 path.
+  static constexpr int kControlDepth = 3;
+  static constexpr int kMaxControlSubdomains = 512;  // 8^3
+  int stack[128];
+  int top = 0;
+  stack[top++] = 0;
+  uint32_t subdomain_indices[kMaxControlSubdomains];
+  int num_subdomains = 0;
+  while (top > 0) {
+    int idx = stack[--top];
+    const OctreeNode8& node = nodes[idx];
+    if (node.contrib.mass == 0.0f) {
       continue;
     }
-    const OctreeNode8& sub = nodes[root.child[c]];
+    if (node.is_leaf || node.depth >= kControlDepth) {
+      if (num_subdomains < kMaxControlSubdomains) {
+        subdomain_indices[num_subdomains++] = static_cast<uint32_t>(idx);
+      }
+      continue;
+    }
+    uint8_t mask = node.child_mask;
+    for (int c = 0; c < 8; c++) {
+      if (mask & (1u << c)) {
+        stack[top++] = static_cast<int>(node.child[c]);
+      }
+    }
+  }
+
+  for (int sd = 0; sd < num_subdomains; sd++) {
+    const OctreeNode8& sub = nodes[subdomain_indices[sd]];
     if (sub.is_leaf) {
       for (uint32_t i = sub.start; i < sub.end; i++) {
         total += softened ? gravityGradSoftCutoff<3>(leaf_data[i], qv)
@@ -1896,7 +1938,8 @@ xla::ffi::Error BarnesHutGravity(cudaStream_t stream,
                                  F32R1Out out,
                                  float beta,
                                  int periodic,
-                                 float box_length) {
+                                 float box_length,
+                                 int threads) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf2) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -1907,6 +1950,9 @@ xla::ffi::Error BarnesHutGravity(cudaStream_t stream,
   int num_queries = static_cast<int>(queries.dimensions()[0]);
   if (queries.dimensions()[1] != 2) {
     return xla::ffi::Error::InvalidArgument("queries dim must be 2");
+  }
+  if (threads <= 0 || threads > 1024) {
+    return xla::ffi::Error::InvalidArgument("threads must be in [1, 1024]");
   }
 
   cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
@@ -1919,7 +1965,6 @@ xla::ffi::Error BarnesHutGravity(cudaStream_t stream,
   const float* queries_ptr = queries.typed_data();
   float* out_ptr = out->typed_data();
 
-  int threads = 64;
   int blocks = (num_queries + threads - 1) / threads;
   barnes_hut_gravity_kernel<<<blocks, threads, 0, stream>>>(
       leaf_data, nodes, queries_ptr, num_queries, beta, out_ptr);
@@ -1939,7 +1984,8 @@ xla::ffi::Error BarnesHutGravity3D(cudaStream_t stream,
                                    F32R1Out out,
                                    float beta,
                                    int periodic,
-                                   float box_length) {
+                                   float box_length,
+                                   int threads) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf3) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -1950,6 +1996,9 @@ xla::ffi::Error BarnesHutGravity3D(cudaStream_t stream,
   int num_queries = static_cast<int>(queries.dimensions()[0]);
   if (queries.dimensions()[1] != 3) {
     return xla::ffi::Error::InvalidArgument("queries dim must be 3");
+  }
+  if (threads <= 0 || threads > 1024) {
+    return xla::ffi::Error::InvalidArgument("threads must be in [1, 1024]");
   }
 
   cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
@@ -1962,7 +2011,6 @@ xla::ffi::Error BarnesHutGravity3D(cudaStream_t stream,
   const float* queries_ptr = queries.typed_data();
   float* out_ptr = out->typed_data();
 
-  int threads = 64;
   int blocks = (num_queries + threads - 1) / threads;
   barnes_hut_gravity_kernel_3d<<<blocks, threads, 0, stream>>>(
       leaf_data, nodes, queries_ptr, num_queries, beta, out_ptr);
@@ -2009,7 +2057,8 @@ xla::ffi::Error BarnesHutForce(cudaStream_t stream,
                                F32R2Out out,
                                float beta,
                                int periodic,
-                               float box_length) {
+                               float box_length,
+                               int threads) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf2) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -2025,6 +2074,9 @@ xla::ffi::Error BarnesHutForce(cudaStream_t stream,
   if (out_dims[0] != num_queries || out_dims[1] != 2) {
     return xla::ffi::Error::InvalidArgument("out shape mismatch");
   }
+  if (threads <= 0 || threads > 1024) {
+    return xla::ffi::Error::InvalidArgument("threads must be in [1, 1024]");
+  }
 
   cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
   if (per_err != cudaSuccess) {
@@ -2036,7 +2088,6 @@ xla::ffi::Error BarnesHutForce(cudaStream_t stream,
   const float* queries_ptr = queries.typed_data();
   float* out_ptr = out->typed_data();
 
-  int threads = 256;
   int blocks = (num_queries + threads - 1) / threads;
   barnes_hut_force_kernel<<<blocks, threads, 0, stream>>>(
       leaf_data, nodes, queries_ptr, num_queries, beta, out_ptr);
@@ -2058,7 +2109,8 @@ xla::ffi::Error SoftenedBarnesHutForce(cudaStream_t stream,
                                        float softening_scale,
                                        float cutoff_scale,
                                        int periodic,
-                                       float box_length) {
+                                       float box_length,
+                                       int threads) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf2) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -2073,6 +2125,9 @@ xla::ffi::Error SoftenedBarnesHutForce(cudaStream_t stream,
   auto out_dims = out->dimensions();
   if (out_dims[0] != num_queries || out_dims[1] != 2) {
     return xla::ffi::Error::InvalidArgument("out shape mismatch");
+  }
+  if (threads <= 0 || threads > 1024) {
+    return xla::ffi::Error::InvalidArgument("threads must be in [1, 1024]");
   }
 
   cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
@@ -2091,7 +2146,6 @@ xla::ffi::Error SoftenedBarnesHutForce(cudaStream_t stream,
   const float* queries_ptr = queries.typed_data();
   float* out_ptr = out->typed_data();
 
-  int threads = 256;
   int blocks = (num_queries + threads - 1) / threads;
   barnes_hut_force_soft_kernel<<<blocks, threads, 0, stream>>>(
       leaf_data, nodes, queries_ptr, num_queries, beta, out_ptr);
@@ -2113,7 +2167,8 @@ xla::ffi::Error SoftenedBarnesHutForce3D(cudaStream_t stream,
                                          float softening_scale,
                                          float cutoff_scale,
                                          int periodic,
-                                         float box_length) {
+                                         float box_length,
+                                         int threads) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf3) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -2128,6 +2183,9 @@ xla::ffi::Error SoftenedBarnesHutForce3D(cudaStream_t stream,
   auto out_dims = out->dimensions();
   if (out_dims[0] != num_queries || out_dims[1] != 3) {
     return xla::ffi::Error::InvalidArgument("out shape mismatch");
+  }
+  if (threads <= 0 || threads > 1024) {
+    return xla::ffi::Error::InvalidArgument("threads must be in [1, 1024]");
   }
 
   cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
@@ -2146,7 +2204,6 @@ xla::ffi::Error SoftenedBarnesHutForce3D(cudaStream_t stream,
   const float* queries_ptr = queries.typed_data();
   float* out_ptr = out->typed_data();
 
-  int threads = 256;
   int blocks = (num_queries + threads - 1) / threads;
   barnes_hut_force_soft_kernel_3d<<<blocks, threads, 0, stream>>>(
       leaf_data, nodes, queries_ptr, num_queries, beta, out_ptr);
@@ -2166,7 +2223,8 @@ xla::ffi::Error BarnesHutForce3D(cudaStream_t stream,
                                  F32R2Out out,
                                  float beta,
                                  int periodic,
-                                 float box_length) {
+                                 float box_length,
+                                 int threads) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf3) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -2182,6 +2240,9 @@ xla::ffi::Error BarnesHutForce3D(cudaStream_t stream,
   if (out_dims[0] != num_queries || out_dims[1] != 3) {
     return xla::ffi::Error::InvalidArgument("out shape mismatch");
   }
+  if (threads <= 0 || threads > 1024) {
+    return xla::ffi::Error::InvalidArgument("threads must be in [1, 1024]");
+  }
 
   cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
   if (per_err != cudaSuccess) {
@@ -2193,7 +2254,6 @@ xla::ffi::Error BarnesHutForce3D(cudaStream_t stream,
   const float* queries_ptr = queries.typed_data();
   float* out_ptr = out->typed_data();
 
-  int threads = 256;
   int blocks = (num_queries + threads - 1) / threads;
   barnes_hut_force_kernel_3d<<<blocks, threads, 0, stream>>>(
       leaf_data, nodes, queries_ptr, num_queries, beta, out_ptr);
@@ -2215,7 +2275,8 @@ xla::ffi::Error StochasticBarnesHutGravity(cudaStream_t stream,
                                            int samples_per_subdomain,
                                            int seed,
                                            int periodic,
-                                           float box_length) {
+                                           float box_length,
+                                           int threads) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf2) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -2229,6 +2290,9 @@ xla::ffi::Error StochasticBarnesHutGravity(cudaStream_t stream,
   int num_queries = static_cast<int>(queries.dimensions()[0]);
   if (queries.dimensions()[1] != 2) {
     return xla::ffi::Error::InvalidArgument("queries dim must be 2");
+  }
+  if (threads <= 0 || threads > 1024) {
+    return xla::ffi::Error::InvalidArgument("threads must be in [1, 1024]");
   }
 
   cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
@@ -2244,7 +2308,6 @@ xla::ffi::Error StochasticBarnesHutGravity(cudaStream_t stream,
   const float* queries_ptr = queries.typed_data();
   float* out_ptr = out->typed_data();
 
-  int threads = 256;
   int blocks = (num_queries + threads - 1) / threads;
   stochastic_bh_gravity_kernel_2d<<<blocks, threads, 0, stream>>>(
       leaf_data, num_points, nodes, contrib, queries_ptr, num_queries,
@@ -2267,7 +2330,8 @@ xla::ffi::Error StochasticBarnesHutGravity3D(cudaStream_t stream,
                                              int samples_per_subdomain,
                                              int seed,
                                              int periodic,
-                                             float box_length) {
+                                             float box_length,
+                                             int threads) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf3) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -2281,6 +2345,9 @@ xla::ffi::Error StochasticBarnesHutGravity3D(cudaStream_t stream,
   int num_queries = static_cast<int>(queries.dimensions()[0]);
   if (queries.dimensions()[1] != 3) {
     return xla::ffi::Error::InvalidArgument("queries dim must be 3");
+  }
+  if (threads <= 0 || threads > 1024) {
+    return xla::ffi::Error::InvalidArgument("threads must be in [1, 1024]");
   }
 
   cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
@@ -2296,7 +2363,6 @@ xla::ffi::Error StochasticBarnesHutGravity3D(cudaStream_t stream,
   const float* queries_ptr = queries.typed_data();
   float* out_ptr = out->typed_data();
 
-  int threads = 256;
   int blocks = (num_queries + threads - 1) / threads;
   stochastic_bh_gravity_kernel_3d<<<blocks, threads, 0, stream>>>(
       leaf_data, num_points, nodes, contrib, queries_ptr, num_queries,
@@ -2319,7 +2385,8 @@ xla::ffi::Error StochasticBarnesHutForce(cudaStream_t stream,
                                          int samples_per_subdomain,
                                          int seed,
                                          int periodic,
-                                         float box_length) {
+                                         float box_length,
+                                         int threads) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf2) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -2333,6 +2400,9 @@ xla::ffi::Error StochasticBarnesHutForce(cudaStream_t stream,
   int num_queries = static_cast<int>(queries.dimensions()[0]);
   if (queries.dimensions()[1] != 2) {
     return xla::ffi::Error::InvalidArgument("queries dim must be 2");
+  }
+  if (threads <= 0 || threads > 1024) {
+    return xla::ffi::Error::InvalidArgument("threads must be in [1, 1024]");
   }
 
   cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
@@ -2348,7 +2418,6 @@ xla::ffi::Error StochasticBarnesHutForce(cudaStream_t stream,
   const float* queries_ptr = queries.typed_data();
   float* out_ptr = out->typed_data();
 
-  int threads = 256;
   int blocks = (num_queries + threads - 1) / threads;
   stochastic_bh_force_kernel_2d<<<blocks, threads, 0, stream>>>(
       leaf_data, num_points, nodes, contrib, queries_ptr, num_queries,
@@ -2371,7 +2440,8 @@ xla::ffi::Error StochasticBarnesHutForce3D(cudaStream_t stream,
                                            int samples_per_subdomain,
                                            int seed,
                                            int periodic,
-                                           float box_length) {
+                                           float box_length,
+                                           int threads) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf3) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -2385,6 +2455,9 @@ xla::ffi::Error StochasticBarnesHutForce3D(cudaStream_t stream,
   int num_queries = static_cast<int>(queries.dimensions()[0]);
   if (queries.dimensions()[1] != 3) {
     return xla::ffi::Error::InvalidArgument("queries dim must be 3");
+  }
+  if (threads <= 0 || threads > 1024) {
+    return xla::ffi::Error::InvalidArgument("threads must be in [1, 1024]");
   }
 
   cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
@@ -2400,7 +2473,6 @@ xla::ffi::Error StochasticBarnesHutForce3D(cudaStream_t stream,
   const float* queries_ptr = queries.typed_data();
   float* out_ptr = out->typed_data();
 
-  int threads = 256;
   int blocks = (num_queries + threads - 1) / threads;
   stochastic_bh_force_kernel_3d<<<blocks, threads, 0, stream>>>(
       leaf_data, num_points, nodes, contrib, queries_ptr, num_queries,
@@ -2425,7 +2497,8 @@ xla::ffi::Error SoftenedStochasticBarnesHutForce(cudaStream_t stream,
                                                  float softening_scale,
                                                  float cutoff_scale,
                                                  int periodic,
-                                                 float box_length) {
+                                                 float box_length,
+                                                 int threads) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf2) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -2443,6 +2516,9 @@ xla::ffi::Error SoftenedStochasticBarnesHutForce(cudaStream_t stream,
   auto out_dims = out->dimensions();
   if (out_dims[0] != num_queries || out_dims[1] != 2) {
     return xla::ffi::Error::InvalidArgument("out shape mismatch");
+  }
+  if (threads <= 0 || threads > 1024) {
+    return xla::ffi::Error::InvalidArgument("threads must be in [1, 1024]");
   }
 
   cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
@@ -2464,7 +2540,6 @@ xla::ffi::Error SoftenedStochasticBarnesHutForce(cudaStream_t stream,
   const float* queries_ptr = queries.typed_data();
   float* out_ptr = out->typed_data();
 
-  int threads = 256;
   int blocks = (num_queries + threads - 1) / threads;
   stochastic_bh_force_soft_kernel_2d<<<blocks, threads, 0, stream>>>(
       leaf_data, num_points, nodes, contrib, queries_ptr, num_queries,
@@ -2489,7 +2564,8 @@ xla::ffi::Error SoftenedStochasticBarnesHutForce3D(cudaStream_t stream,
                                                    float softening_scale,
                                                    float cutoff_scale,
                                                    int periodic,
-                                                   float box_length) {
+                                                   float box_length,
+                                                   int threads) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf3) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -2507,6 +2583,9 @@ xla::ffi::Error SoftenedStochasticBarnesHutForce3D(cudaStream_t stream,
   auto out_dims = out->dimensions();
   if (out_dims[0] != num_queries || out_dims[1] != 3) {
     return xla::ffi::Error::InvalidArgument("out shape mismatch");
+  }
+  if (threads <= 0 || threads > 1024) {
+    return xla::ffi::Error::InvalidArgument("threads must be in [1, 1024]");
   }
 
   cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
@@ -2528,7 +2607,6 @@ xla::ffi::Error SoftenedStochasticBarnesHutForce3D(cudaStream_t stream,
   const float* queries_ptr = queries.typed_data();
   float* out_ptr = out->typed_data();
 
-  int threads = 256;
   int blocks = (num_queries + threads - 1) / threads;
   stochastic_bh_force_soft_kernel_3d<<<blocks, threads, 0, stream>>>(
       leaf_data, num_points, nodes, contrib, queries_ptr, num_queries,
@@ -2549,7 +2627,8 @@ xla::ffi::Error BarnesHutForceOctree8(cudaStream_t stream,
                                       F32R2Out out,
                                       float beta,
                                       int periodic,
-                                      float box_length) {
+                                      float box_length,
+                                      int threads) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf3) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -2564,6 +2643,9 @@ xla::ffi::Error BarnesHutForceOctree8(cudaStream_t stream,
   if (out_dims[0] != num_queries || out_dims[1] != 3) {
     return xla::ffi::Error::InvalidArgument("out shape mismatch");
   }
+  if (threads <= 0 || threads > 1024) {
+    return xla::ffi::Error::InvalidArgument("threads must be in [1, 1024]");
+  }
 
   cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
   if (per_err != cudaSuccess) {
@@ -2577,7 +2659,6 @@ xla::ffi::Error BarnesHutForceOctree8(cudaStream_t stream,
   const float* queries_ptr = queries.typed_data();
   float* out_ptr = out->typed_data();
 
-  int threads = 256;
   int blocks = (num_queries + threads - 1) / threads;
   barnes_hut_force_octree8_kernel<<<blocks, threads, 0, stream>>>(
       leaf_data, nodes, queries_ptr, num_queries, beta, out_ptr);
@@ -2598,7 +2679,8 @@ xla::ffi::Error SoftenedBarnesHutForceOctree8(cudaStream_t stream,
                                               float softening_scale,
                                               float cutoff_scale,
                                               int periodic,
-                                              float box_length) {
+                                              float box_length,
+                                              int threads) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf3) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -2612,6 +2694,9 @@ xla::ffi::Error SoftenedBarnesHutForceOctree8(cudaStream_t stream,
   auto out_dims = out->dimensions();
   if (out_dims[0] != num_queries || out_dims[1] != 3) {
     return xla::ffi::Error::InvalidArgument("out shape mismatch");
+  }
+  if (threads <= 0 || threads > 1024) {
+    return xla::ffi::Error::InvalidArgument("threads must be in [1, 1024]");
   }
 
   cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
@@ -2631,7 +2716,6 @@ xla::ffi::Error SoftenedBarnesHutForceOctree8(cudaStream_t stream,
   const float* queries_ptr = queries.typed_data();
   float* out_ptr = out->typed_data();
 
-  int threads = 256;
   int blocks = (num_queries + threads - 1) / threads;
   barnes_hut_force_octree8_soft_kernel<<<blocks, threads, 0, stream>>>(
       leaf_data, nodes, queries_ptr, num_queries, beta, out_ptr);
@@ -2653,7 +2737,8 @@ xla::ffi::Error SoftenedBarnesHutForceOctree8Vjp(cudaStream_t stream,
                                                  float softening_scale,
                                                  float cutoff_scale,
                                                  int periodic,
-                                                 float box_length) {
+                                                 float box_length,
+                                                 int threads) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf3) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -2670,6 +2755,9 @@ xla::ffi::Error SoftenedBarnesHutForceOctree8Vjp(cudaStream_t stream,
   auto out_dims = out->dimensions();
   if (out_dims[0] != num_queries || out_dims[1] != 3) {
     return xla::ffi::Error::InvalidArgument("out shape mismatch");
+  }
+  if (threads <= 0 || threads > 1024) {
+    return xla::ffi::Error::InvalidArgument("threads must be in [1, 1024]");
   }
 
   cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
@@ -2690,7 +2778,6 @@ xla::ffi::Error SoftenedBarnesHutForceOctree8Vjp(cudaStream_t stream,
   const float* cotangent_ptr = cotangent.typed_data();
   float* out_ptr = out->typed_data();
 
-  int threads = 256;
   int blocks = (num_queries + threads - 1) / threads;
   barnes_hut_force_octree8_soft_vjp_kernel<<<blocks, threads, 0, stream>>>(
       leaf_data, nodes, queries_ptr, cotangent_ptr, num_queries, beta, out_ptr);
@@ -2710,7 +2797,8 @@ xla::ffi::Error StochasticBarnesHutForceOctree8(cudaStream_t stream,
                                                 int samples_per_subdomain,
                                                 int seed,
                                                 int periodic,
-                                                float box_length) {
+                                                float box_length,
+                                                int threads) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf3) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -2725,6 +2813,9 @@ xla::ffi::Error StochasticBarnesHutForceOctree8(cudaStream_t stream,
   if (out_dims[0] != num_queries || out_dims[1] != 3) {
     return xla::ffi::Error::InvalidArgument("out shape mismatch");
   }
+  if (threads <= 0 || threads > 1024) {
+    return xla::ffi::Error::InvalidArgument("threads must be in [1, 1024]");
+  }
 
   cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
   if (per_err != cudaSuccess) {
@@ -2738,7 +2829,6 @@ xla::ffi::Error StochasticBarnesHutForceOctree8(cudaStream_t stream,
   const float* queries_ptr = queries.typed_data();
   float* out_ptr = out->typed_data();
 
-  int threads = 256;
   int blocks = (num_queries + threads - 1) / threads;
   stochastic_bh_force_octree8_kernel<<<blocks, threads, 0, stream>>>(
       leaf_data, nodes, queries_ptr, num_queries, samples_per_subdomain, seed,
@@ -2762,7 +2852,8 @@ xla::ffi::Error SoftenedStochasticBarnesHutForceOctree8(
     float softening_scale,
     float cutoff_scale,
     int periodic,
-    float box_length) {
+    float box_length,
+    int threads) {
   if (leaf_bytes.size_bytes() % sizeof(Leaf3) != 0) {
     return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
   }
@@ -2776,6 +2867,9 @@ xla::ffi::Error SoftenedStochasticBarnesHutForceOctree8(
   auto out_dims = out->dimensions();
   if (out_dims[0] != num_queries || out_dims[1] != 3) {
     return xla::ffi::Error::InvalidArgument("out shape mismatch");
+  }
+  if (threads <= 0 || threads > 1024) {
+    return xla::ffi::Error::InvalidArgument("threads must be in [1, 1024]");
   }
 
   cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
@@ -2795,7 +2889,6 @@ xla::ffi::Error SoftenedStochasticBarnesHutForceOctree8(
   const float* queries_ptr = queries.typed_data();
   float* out_ptr = out->typed_data();
 
-  int threads = 256;
   int blocks = (num_queries + threads - 1) / threads;
   stochastic_bh_force_octree8_kernel<<<blocks, threads, 0, stream>>>(
       leaf_data, nodes, queries_ptr, num_queries, samples_per_subdomain, seed,
@@ -2817,7 +2910,10 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<sbh_ffi::F32R2>()
         .Arg<sbh_ffi::F32R1>()
         .Arg<sbh_ffi::F32R2>()
-        .Ret<sbh_ffi::F32R1>());
+        .Ret<sbh_ffi::F32R1>()
+        .Attr<int>("periodic")
+        .Attr<float>("box_length")
+        .Attr<int>("threads"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_build_octree_level3_buffers_ffi, sbh_ffi::BuildOctreeLevel3Buffers,
@@ -2856,7 +2952,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<sbh_ffi::F32R1>()
         .Attr<float>("beta")
         .Attr<int>("periodic")
-        .Attr<float>("box_length"));
+        .Attr<float>("box_length")
+        .Attr<int>("threads"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_barnes_hut_force_ffi, sbh_ffi::BarnesHutForce,
@@ -2868,7 +2965,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<sbh_ffi::F32R2>()
         .Attr<float>("beta")
         .Attr<int>("periodic")
-        .Attr<float>("box_length"));
+        .Attr<float>("box_length")
+        .Attr<int>("threads"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_barnes_hut_gravity_ffi_3d, sbh_ffi::BarnesHutGravity3D,
@@ -2880,7 +2978,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<sbh_ffi::F32R1>()
         .Attr<float>("beta")
         .Attr<int>("periodic")
-        .Attr<float>("box_length"));
+        .Attr<float>("box_length")
+        .Attr<int>("threads"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_barnes_hut_force_ffi_3d, sbh_ffi::BarnesHutForce3D,
@@ -2892,7 +2991,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<sbh_ffi::F32R2>()
         .Attr<float>("beta")
         .Attr<int>("periodic")
-        .Attr<float>("box_length"));
+        .Attr<float>("box_length")
+        .Attr<int>("threads"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_barnes_hut_force_octree8_ffi, sbh_ffi::BarnesHutForceOctree8,
@@ -2904,7 +3004,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<sbh_ffi::F32R2>()
         .Attr<float>("beta")
         .Attr<int>("periodic")
-        .Attr<float>("box_length"));
+        .Attr<float>("box_length")
+        .Attr<int>("threads"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_barnes_hut_force_octree8_soft_ffi,
@@ -2919,7 +3020,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<float>("softening_scale")
         .Attr<float>("cutoff_scale")
         .Attr<int>("periodic")
-        .Attr<float>("box_length"));
+        .Attr<float>("box_length")
+        .Attr<int>("threads"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_barnes_hut_force_octree8_soft_vjp_ffi,
@@ -2935,7 +3037,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<float>("softening_scale")
         .Attr<float>("cutoff_scale")
         .Attr<int>("periodic")
-        .Attr<float>("box_length"));
+        .Attr<float>("box_length")
+        .Attr<int>("threads"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_barnes_hut_force_soft_ffi, sbh_ffi::SoftenedBarnesHutForce,
@@ -2949,7 +3052,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<float>("softening_scale")
         .Attr<float>("cutoff_scale")
         .Attr<int>("periodic")
-        .Attr<float>("box_length"));
+        .Attr<float>("box_length")
+        .Attr<int>("threads"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_barnes_hut_force_soft_ffi_3d, sbh_ffi::SoftenedBarnesHutForce3D,
@@ -2963,7 +3067,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<float>("softening_scale")
         .Attr<float>("cutoff_scale")
         .Attr<int>("periodic")
-        .Attr<float>("box_length"));
+        .Attr<float>("box_length")
+        .Attr<int>("threads"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_stochastic_bh_gravity_ffi, sbh_ffi::StochasticBarnesHutGravity,
@@ -2977,7 +3082,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int>("samples_per_subdomain")
         .Attr<int>("seed")
         .Attr<int>("periodic")
-        .Attr<float>("box_length"));
+        .Attr<float>("box_length")
+        .Attr<int>("threads"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_stochastic_bh_gravity_ffi_3d, sbh_ffi::StochasticBarnesHutGravity3D,
@@ -2991,7 +3097,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int>("samples_per_subdomain")
         .Attr<int>("seed")
         .Attr<int>("periodic")
-        .Attr<float>("box_length"));
+        .Attr<float>("box_length")
+        .Attr<int>("threads"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_stochastic_bh_force_ffi, sbh_ffi::StochasticBarnesHutForce,
@@ -3005,7 +3112,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int>("samples_per_subdomain")
         .Attr<int>("seed")
         .Attr<int>("periodic")
-        .Attr<float>("box_length"));
+        .Attr<float>("box_length")
+        .Attr<int>("threads"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_stochastic_bh_force_ffi_3d, sbh_ffi::StochasticBarnesHutForce3D,
@@ -3019,7 +3127,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int>("samples_per_subdomain")
         .Attr<int>("seed")
         .Attr<int>("periodic")
-        .Attr<float>("box_length"));
+        .Attr<float>("box_length")
+        .Attr<int>("threads"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_stochastic_bh_force_octree8_ffi,
@@ -3033,7 +3142,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int>("samples_per_subdomain")
         .Attr<int>("seed")
         .Attr<int>("periodic")
-        .Attr<float>("box_length"));
+        .Attr<float>("box_length")
+        .Attr<int>("threads"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_stochastic_bh_force_octree8_soft_ffi,
@@ -3049,7 +3159,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<float>("softening_scale")
         .Attr<float>("cutoff_scale")
         .Attr<int>("periodic")
-        .Attr<float>("box_length"));
+        .Attr<float>("box_length")
+        .Attr<int>("threads"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_stochastic_bh_force_soft_ffi, sbh_ffi::SoftenedStochasticBarnesHutForce,
@@ -3065,7 +3176,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<float>("softening_scale")
         .Attr<float>("cutoff_scale")
         .Attr<int>("periodic")
-        .Attr<float>("box_length"));
+        .Attr<float>("box_length")
+        .Attr<int>("threads"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     sbh_stochastic_bh_force_soft_ffi_3d,
@@ -3082,7 +3194,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<float>("softening_scale")
         .Attr<float>("cutoff_scale")
         .Attr<int>("periodic")
-        .Attr<float>("box_length"));
+        .Attr<float>("box_length")
+        .Attr<int>("threads"));
 
 extern "C" size_t sbh_leaf3_size() {
   return sizeof(sbh_ffi::Leaf3);
