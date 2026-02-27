@@ -164,6 +164,8 @@ def _make_treepm_cv_stochastic_accel_fn(
                 seed=base_seed + step_i,
                 softening_scale=cfg.bh_softening,
                 cutoff_scale=cfg.pm_r_split_cells,
+                prune_enabled=cfg.bh_prune_enabled,
+                prune_r_cut_mult=cfg.bh_prune_r_cut_mult,
                 periodic=True,
                 box_length=float(mesh_n),
             )
@@ -318,6 +320,8 @@ def run(args):
         pm_r_split_cells=args.pm_r_split_cells,
         tree_short_scale=1.0 / (4.0 * math.pi),
         seed=args.cv_base_seed,
+        bh_prune_enabled=bool(args.bh_prune_enabled),
+        bh_prune_r_cut_mult=args.bh_prune_r_cut_mult,
     )
 
     if args.tree_short_scale == "auto":
@@ -460,6 +464,18 @@ def build_parser():
     p.add_argument("--bh-softening", type=float, default=0.05)
     p.add_argument("--bh-beta", type=float, default=1.7)
     p.add_argument("--bh-max-depth", type=int, default=4)
+    p.add_argument(
+        "--bh-prune-enabled",
+        type=int,
+        default=1,
+        help="Enable AABB tree pruning for softened BH short-range (1/0).",
+    )
+    p.add_argument(
+        "--bh-prune-r-cut-mult",
+        type=float,
+        default=4.0,
+        help="Prune radius multiplier: r_cut = bh_prune_r_cut_mult * pm_r_split_cells.",
+    )
     p.add_argument("--tree-short-scale", type=str, default="1_over_4pi")
     p.add_argument("--cv-refresh-every", type=int, default=1)
     p.add_argument("--cv-samples-per-subdomain", type=int, default=4)

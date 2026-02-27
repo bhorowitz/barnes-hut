@@ -33,6 +33,8 @@ using U8R1Out = xla::ffi::ResultBuffer<xla::ffi::U8, 1>;
 
 inline cudaError_t SetPeriodicBox(cudaStream_t stream, int periodic,
                                   float box_length);
+inline cudaError_t SetSofteningCutoff(cudaStream_t stream, float softening,
+                                      float cutoff);
 
 static constexpr int kOctreeDimSplit = 8;
 static constexpr int kOctreeNumBins =
@@ -90,14 +92,33 @@ __global__ void barnes_hut_force_octree8_kernel(
     int num_queries, float beta, float* out);
 __global__ void barnes_hut_force_octree8_soft_kernel(
     const Leaf3* leaf_data, const OctreeNode8* nodes, const float* queries,
-    int num_queries, float beta, float* out);
+    int num_queries, float beta, int prune_enabled, float prune_r_cut_sq,
+    float* out);
 __global__ void barnes_hut_force_octree8_soft_vjp_kernel(
     const Leaf3* leaf_data, const OctreeNode8* nodes, const float* queries,
-    const float* cotangent, int num_queries, float beta, float* out);
+    const float* cotangent, int num_queries, float beta, int prune_enabled,
+    float prune_r_cut_sq, float* out);
+__global__ void direct_force_softened_3d_kernel(const float* points,
+                                                const float* masses,
+                                                const float* queries,
+                                                int num_points, int num_queries,
+                                                float* out);
+__global__ void direct_force_softened_3d_vjp_kernel(const float* points,
+                                                    const float* masses,
+                                                    const float* queries,
+                                                    const float* cotangent,
+                                                    int num_points,
+                                                    int num_queries,
+                                                    float* out);
 __global__ void stochastic_bh_force_octree8_kernel(
     const Leaf3* leaf_data, const OctreeNode8* nodes, const float* queries,
-    int num_queries, int samples_per_subdomain, int seed, float* out,
-    bool softened);
+    int num_queries, int samples_per_subdomain, int seed, float beta, float* out,
+    bool softened, int prune_enabled, float prune_r_cut_sq);
+__global__ void stochastic_bh_force_octree8_vjp_kernel(
+    const Leaf3* leaf_data, const OctreeNode8* nodes, const float* queries,
+    const float* cotangent, int num_queries, int samples_per_subdomain, int seed,
+    float beta, float* out, bool softened, int prune_enabled,
+    float prune_r_cut_sq);
 
 struct Node3Layout {
   uint64_t start_;
@@ -407,6 +428,123 @@ __global__ void brute_force_gravity_kernel(const float* points,
   out[q] = acc;
 }
 
+__device__ __forceinline__ void softened_force_pair_3d(
+    const float* p_ptr, float mass, const float* q_ptr, float* fx, float* fy,
+    float* fz) {
+  float rx = q_ptr[0] - p_ptr[0];
+  float ry = q_ptr[1] - p_ptr[1];
+  float rz = q_ptr[2] - p_ptr[2];
+  if (g_periodic_min_image != 0 && g_periodic_box_length > 0.0f) {
+    float inv_l = 1.0f / g_periodic_box_length;
+    rx -= g_periodic_box_length * nearbyintf(rx * inv_l);
+    ry -= g_periodic_box_length * nearbyintf(ry * inv_l);
+    rz -= g_periodic_box_length * nearbyintf(rz * inv_l);
+  }
+
+  float r2 = rx * rx + ry * ry + rz * rz;
+  float eps = fmaxf(g_softening_scale, 0.0f);
+  float inv_r = rsqrtf(r2 + eps * eps + 1e-12f);
+  float inv_r3 = inv_r * inv_r * inv_r;
+  float attenuation = 1.0f;
+  if (g_cutoff_scale > 0.0f) {
+    float dist = sqrtf(r2 + 1e-12f);
+    float u = dist / (2.0f * g_cutoff_scale);
+    float exp_u2 = expf(-(u * u));
+    attenuation = erfcf(u) + (2.0f / 1.772453850905516f) * u * exp_u2;
+  }
+
+  float coeff = -mass * attenuation * inv_r3;
+  *fx += coeff * rx;
+  *fy += coeff * ry;
+  *fz += coeff * rz;
+}
+
+__device__ __forceinline__ void softened_force_pair_3d_vjp(
+    const float* p_ptr, float mass, const float* q_ptr, const float* g_ptr,
+    float* gx, float* gy, float* gz) {
+  float rx = q_ptr[0] - p_ptr[0];
+  float ry = q_ptr[1] - p_ptr[1];
+  float rz = q_ptr[2] - p_ptr[2];
+  if (g_periodic_min_image != 0 && g_periodic_box_length > 0.0f) {
+    float inv_l = 1.0f / g_periodic_box_length;
+    rx -= g_periodic_box_length * nearbyintf(rx * inv_l);
+    ry -= g_periodic_box_length * nearbyintf(ry * inv_l);
+    rz -= g_periodic_box_length * nearbyintf(rz * inv_l);
+  }
+
+  float r2 = rx * rx + ry * ry + rz * rz;
+  float eps = fmaxf(g_softening_scale, 0.0f);
+  float inv_r = rsqrtf(r2 + eps * eps + 1e-12f);
+  float inv_r3 = inv_r * inv_r * inv_r;
+  float inv_r5 = inv_r3 * inv_r * inv_r;
+  float attenuation = 1.0f;
+  float cutoff_coeff = 0.0f;
+  if (g_cutoff_scale > 0.0f) {
+    float dist = sqrtf(r2 + 1e-12f);
+    float u = dist / (2.0f * g_cutoff_scale);
+    float exp_u2 = expf(-(u * u));
+    attenuation = erfcf(u) + (2.0f / 1.772453850905516f) * u * exp_u2;
+    cutoff_coeff = inv_r3 * dist * exp_u2 /
+                   (2.0f * 1.772453850905516f * g_cutoff_scale *
+                    g_cutoff_scale * g_cutoff_scale);
+  }
+
+  float ggx = g_ptr[0];
+  float ggy = g_ptr[1];
+  float ggz = g_ptr[2];
+  float rg = rx * ggx + ry * ggy + rz * ggz;
+  float linear = attenuation * inv_r3;
+  float radial = rg * (3.0f * attenuation * inv_r5 + cutoff_coeff);
+  *gx += -mass * (linear * ggx - radial * rx);
+  *gy += -mass * (linear * ggy - radial * ry);
+  *gz += -mass * (linear * ggz - radial * rz);
+}
+
+__global__ void direct_force_softened_3d_kernel(const float* points,
+                                                const float* masses,
+                                                const float* queries,
+                                                int num_points, int num_queries,
+                                                float* out) {
+  int q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q >= num_queries) {
+    return;
+  }
+
+  const float* q_ptr = queries + static_cast<int64_t>(q) * 3;
+  float fx = 0.0f, fy = 0.0f, fz = 0.0f;
+  for (int i = 0; i < num_points; ++i) {
+    const float* p_ptr = points + static_cast<int64_t>(i) * 3;
+    softened_force_pair_3d(p_ptr, masses[i], q_ptr, &fx, &fy, &fz);
+  }
+  out[q * 3 + 0] = fx;
+  out[q * 3 + 1] = fy;
+  out[q * 3 + 2] = fz;
+}
+
+__global__ void direct_force_softened_3d_vjp_kernel(const float* points,
+                                                    const float* masses,
+                                                    const float* queries,
+                                                    const float* cotangent,
+                                                    int num_points,
+                                                    int num_queries,
+                                                    float* out) {
+  int q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q >= num_queries) {
+    return;
+  }
+
+  const float* q_ptr = queries + static_cast<int64_t>(q) * 3;
+  const float* g_ptr = cotangent + static_cast<int64_t>(q) * 3;
+  float gx = 0.0f, gy = 0.0f, gz = 0.0f;
+  for (int i = 0; i < num_points; ++i) {
+    const float* p_ptr = points + static_cast<int64_t>(i) * 3;
+    softened_force_pair_3d_vjp(p_ptr, masses[i], q_ptr, g_ptr, &gx, &gy, &gz);
+  }
+  out[q * 3 + 0] = gx;
+  out[q * 3 + 1] = gy;
+  out[q * 3 + 2] = gz;
+}
+
 xla::ffi::Error BruteForceGravity(cudaStream_t stream,
                                   F32R2 points,
                                   F32R1 masses,
@@ -456,6 +594,142 @@ xla::ffi::Error BruteForceGravity(cudaStream_t stream,
     return xla::ffi::Error::Internal(cudaGetErrorString(err));
   }
 
+  return xla::ffi::Error::Success();
+}
+
+xla::ffi::Error SoftenedDirectForce(cudaStream_t stream,
+                                    F32R2 points,
+                                    F32R1 masses,
+                                    F32R2 queries,
+                                    F32R2Out out,
+                                    float softening_scale,
+                                    float cutoff_scale,
+                                    int periodic,
+                                    float box_length,
+                                    int threads) {
+  auto points_dims = points.dimensions();
+  auto queries_dims = queries.dimensions();
+  if (points_dims.size() != 2 || queries_dims.size() != 2) {
+    return xla::ffi::Error::InvalidArgument("points/queries must be rank-2");
+  }
+  int num_points = static_cast<int>(points_dims[0]);
+  int num_queries = static_cast<int>(queries_dims[0]);
+  int dim = static_cast<int>(points_dims[1]);
+  if (dim != 3 || queries_dims[1] != 3) {
+    return xla::ffi::Error::InvalidArgument("points/queries must have dim=3");
+  }
+  if (num_points != static_cast<int>(masses.element_count())) {
+    return xla::ffi::Error::InvalidArgument("masses length mismatch");
+  }
+  auto out_dims = out->dimensions();
+  if (out_dims[0] != num_queries || out_dims[1] != 3) {
+    return xla::ffi::Error::InvalidArgument("out shape mismatch");
+  }
+  if (softening_scale < 0.0f) {
+    return xla::ffi::Error::InvalidArgument("softening_scale must be >= 0");
+  }
+  if (cutoff_scale <= 0.0f) {
+    return xla::ffi::Error::InvalidArgument("cutoff_scale must be > 0");
+  }
+  if (threads <= 0 || threads > 1024) {
+    return xla::ffi::Error::InvalidArgument("threads must be in [1, 1024]");
+  }
+
+  cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
+  if (per_err != cudaSuccess) {
+    return xla::ffi::Error::Internal(cudaGetErrorString(per_err));
+  }
+  cudaError_t set_err = SetSofteningCutoff(stream, softening_scale, cutoff_scale);
+  if (set_err != cudaSuccess) {
+    return xla::ffi::Error::Internal(cudaGetErrorString(set_err));
+  }
+
+  const float* points_ptr = points.typed_data();
+  const float* masses_ptr = masses.typed_data();
+  const float* queries_ptr = queries.typed_data();
+  float* out_ptr = out->typed_data();
+
+  int blocks = (num_queries + threads - 1) / threads;
+  direct_force_softened_3d_kernel<<<blocks, threads, 0, stream>>>(
+      points_ptr, masses_ptr, queries_ptr, num_points, num_queries, out_ptr);
+
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    return xla::ffi::Error::Internal(cudaGetErrorString(err));
+  }
+  return xla::ffi::Error::Success();
+}
+
+xla::ffi::Error SoftenedDirectForceVjp(cudaStream_t stream,
+                                       F32R2 points,
+                                       F32R1 masses,
+                                       F32R2 queries,
+                                       F32R2 cotangent,
+                                       F32R2Out out,
+                                       float softening_scale,
+                                       float cutoff_scale,
+                                       int periodic,
+                                       float box_length,
+                                       int threads) {
+  auto points_dims = points.dimensions();
+  auto queries_dims = queries.dimensions();
+  auto cot_dims = cotangent.dimensions();
+  if (points_dims.size() != 2 || queries_dims.size() != 2 ||
+      cot_dims.size() != 2) {
+    return xla::ffi::Error::InvalidArgument(
+        "points/queries/cotangent must be rank-2");
+  }
+  int num_points = static_cast<int>(points_dims[0]);
+  int num_queries = static_cast<int>(queries_dims[0]);
+  int dim = static_cast<int>(points_dims[1]);
+  if (dim != 3 || queries_dims[1] != 3 || cot_dims[1] != 3) {
+    return xla::ffi::Error::InvalidArgument(
+        "points/queries/cotangent must have dim=3");
+  }
+  if (cot_dims[0] != num_queries) {
+    return xla::ffi::Error::InvalidArgument("cotangent shape mismatch");
+  }
+  if (num_points != static_cast<int>(masses.element_count())) {
+    return xla::ffi::Error::InvalidArgument("masses length mismatch");
+  }
+  auto out_dims = out->dimensions();
+  if (out_dims[0] != num_queries || out_dims[1] != 3) {
+    return xla::ffi::Error::InvalidArgument("out shape mismatch");
+  }
+  if (softening_scale < 0.0f) {
+    return xla::ffi::Error::InvalidArgument("softening_scale must be >= 0");
+  }
+  if (cutoff_scale <= 0.0f) {
+    return xla::ffi::Error::InvalidArgument("cutoff_scale must be > 0");
+  }
+  if (threads <= 0 || threads > 1024) {
+    return xla::ffi::Error::InvalidArgument("threads must be in [1, 1024]");
+  }
+
+  cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
+  if (per_err != cudaSuccess) {
+    return xla::ffi::Error::Internal(cudaGetErrorString(per_err));
+  }
+  cudaError_t set_err = SetSofteningCutoff(stream, softening_scale, cutoff_scale);
+  if (set_err != cudaSuccess) {
+    return xla::ffi::Error::Internal(cudaGetErrorString(set_err));
+  }
+
+  const float* points_ptr = points.typed_data();
+  const float* masses_ptr = masses.typed_data();
+  const float* queries_ptr = queries.typed_data();
+  const float* cot_ptr = cotangent.typed_data();
+  float* out_ptr = out->typed_data();
+
+  int blocks = (num_queries + threads - 1) / threads;
+  direct_force_softened_3d_vjp_kernel<<<blocks, threads, 0, stream>>>(
+      points_ptr, masses_ptr, queries_ptr, cot_ptr, num_points, num_queries,
+      out_ptr);
+
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    return xla::ffi::Error::Internal(cudaGetErrorString(err));
+  }
   return xla::ffi::Error::Success();
 }
 
@@ -1626,6 +1900,53 @@ __device__ __forceinline__ uint32_t octree8_child_slot(const OctreeNode8& node,
   return ix | (iy << 1) | (iz << 2);
 }
 
+__device__ __forceinline__ float point_aabb_axis_dist(float q, float lo,
+                                                       float hi) {
+  if (q < lo) {
+    return lo - q;
+  }
+  if (q > hi) {
+    return q - hi;
+  }
+  return 0.0f;
+}
+
+__device__ __forceinline__ float octree8_min_dist2_point_aabb_periodic(
+    const OctreeNode8& node, VectorNd<3> q) {
+  float qx = q(0);
+  float qy = q(1);
+  float qz = q(2);
+
+  if (g_periodic_min_image != 0 && g_periodic_box_length > 0.0f) {
+    float inv_l = 1.0f / g_periodic_box_length;
+    qx -= g_periodic_box_length * nearbyintf((qx - node.cx) * inv_l);
+    qy -= g_periodic_box_length * nearbyintf((qy - node.cy) * inv_l);
+    qz -= g_periodic_box_length * nearbyintf((qz - node.cz) * inv_l);
+  }
+
+  float lo_x = node.cx - node.half_size;
+  float lo_y = node.cy - node.half_size;
+  float lo_z = node.cz - node.half_size;
+  float hi_x = node.cx + node.half_size;
+  float hi_y = node.cy + node.half_size;
+  float hi_z = node.cz + node.half_size;
+
+  float dx = point_aabb_axis_dist(qx, lo_x, hi_x);
+  float dy = point_aabb_axis_dist(qy, lo_y, hi_y);
+  float dz = point_aabb_axis_dist(qz, lo_z, hi_z);
+  return dx * dx + dy * dy + dz * dz;
+}
+
+__device__ __forceinline__ bool octree8_should_prune(const OctreeNode8& node,
+                                                     VectorNd<3> q,
+                                                     int prune_enabled,
+                                                     float prune_r_cut_sq) {
+  if (prune_enabled == 0) {
+    return false;
+  }
+  return octree8_min_dist2_point_aabb_periodic(node, q) > prune_r_cut_sq;
+}
+
 __global__ void barnes_hut_force_octree8_kernel(
     const Leaf3* leaf_data, const OctreeNode8* nodes, const float* queries,
     int num_queries, float beta, float* out) {
@@ -1673,7 +1994,8 @@ __global__ void barnes_hut_force_octree8_kernel(
 
 __global__ void barnes_hut_force_octree8_soft_kernel(
     const Leaf3* leaf_data, const OctreeNode8* nodes, const float* queries,
-    int num_queries, float beta, float* out) {
+    int num_queries, float beta, int prune_enabled, float prune_r_cut_sq,
+    float* out) {
   int q = blockIdx.x * blockDim.x + threadIdx.x;
   if (q >= num_queries) {
     return;
@@ -1691,6 +2013,9 @@ __global__ void barnes_hut_force_octree8_soft_kernel(
     int idx = stack[--top];
     const OctreeNode8& node = nodes[idx];
     if (node.contrib.mass == 0.0f) {
+      continue;
+    }
+    if (octree8_should_prune(node, qv, prune_enabled, prune_r_cut_sq)) {
       continue;
     }
     if (octree8_use_far_field(node, qv, beta)) {
@@ -1716,9 +2041,28 @@ __global__ void barnes_hut_force_octree8_soft_kernel(
   out[q * 3 + 2] = acc(2);
 }
 
-__device__ __forceinline__ VectorNd<3> gravityGradSoftCutoffVjp(
-    const Leaf3& data, VectorNd<3> q, VectorNd<3> g) {
-  VectorNd<3> r = minImageDisplacement<3>(q - data.position);
+template <int N>
+__device__ __forceinline__ VectorNd<N> gravityGradVjp(const LeafData<N>& data,
+                                                      VectorNd<N> q,
+                                                      VectorNd<N> g) {
+  VectorNd<N> r = minImageDisplacement<N>(q - data.position);
+  float dist_sq = r.squaredNorm();
+  float dist = sqrtf(dist_sq + 1e-12f);
+  // Matches gravityGrad() smoothing: dist -> dist + 1e-1 in the denominator.
+  float denom = dist + 1e-1f;
+  float inv_denom3 = 1.0f / (denom * denom * denom);
+  float inv_denom4 = inv_denom3 / denom;
+  float rg = r.dot(g);
+  float dist_inv = 1.0f / (dist + 1e-12f);
+  VectorNd<N> grad =
+      inv_denom3 * g - (3.0f * rg * dist_inv * inv_denom4) * r;
+  return -data.mass * grad;
+}
+
+template <int N>
+__device__ __forceinline__ VectorNd<N> gravityGradSoftCutoffVjp(
+    const LeafData<N>& data, VectorNd<N> q, VectorNd<N> g) {
+  VectorNd<N> r = minImageDisplacement<N>(q - data.position);
   float r2 = r.squaredNorm();
   float eps = fmaxf(g_softening_scale, 0.0f);
   float inv_r = rsqrtf(r2 + eps * eps + 1e-12f);
@@ -1740,14 +2084,15 @@ __device__ __forceinline__ VectorNd<3> gravityGradSoftCutoffVjp(
          g_cutoff_scale);
   }
   float rg = r.dot(g);
-  VectorNd<3> grad = attenuation * inv_r3 * g -
+  VectorNd<N> grad = attenuation * inv_r3 * g -
                      rg * (3.0f * attenuation * inv_r5 + cutoff_coeff) * r;
   return -data.mass * grad;
 }
 
 __global__ void barnes_hut_force_octree8_soft_vjp_kernel(
     const Leaf3* leaf_data, const OctreeNode8* nodes, const float* queries,
-    const float* cotangent, int num_queries, float beta, float* out) {
+    const float* cotangent, int num_queries, float beta, int prune_enabled,
+    float prune_r_cut_sq, float* out) {
   int q = blockIdx.x * blockDim.x + threadIdx.x;
   if (q >= num_queries) {
     return;
@@ -1772,13 +2117,16 @@ __global__ void barnes_hut_force_octree8_soft_vjp_kernel(
     if (node.contrib.mass == 0.0f) {
       continue;
     }
+    if (octree8_should_prune(node, qv, prune_enabled, prune_r_cut_sq)) {
+      continue;
+    }
     if (octree8_use_far_field(node, qv, beta)) {
       if (node.is_leaf) {
         for (uint32_t i = node.start; i < node.end; i++) {
-          grad += gravityGradSoftCutoffVjp(leaf_data[i], qv, gv);
+          grad += gravityGradSoftCutoffVjp<3>(leaf_data[i], qv, gv);
         }
       } else {
-        grad += gravityGradSoftCutoffVjp(node.contrib, qv, gv);
+        grad += gravityGradSoftCutoffVjp<3>(node.contrib, qv, gv);
       }
     } else {
       uint8_t mask = node.child_mask;
@@ -1797,8 +2145,8 @@ __global__ void barnes_hut_force_octree8_soft_vjp_kernel(
 
 __global__ void stochastic_bh_force_octree8_kernel(
     const Leaf3* leaf_data, const OctreeNode8* nodes, const float* queries,
-    int num_queries, int samples_per_subdomain, int seed, float* out,
-    bool softened) {
+    int num_queries, int samples_per_subdomain, int seed, float beta, float* out,
+    bool softened, int prune_enabled, float prune_r_cut_sq) {
   int q = blockIdx.x * blockDim.x + threadIdx.x;
   if (q >= num_queries) {
     return;
@@ -1845,6 +2193,9 @@ __global__ void stochastic_bh_force_octree8_kernel(
 
   for (int sd = 0; sd < num_subdomains; sd++) {
     const OctreeNode8& sub = nodes[subdomain_indices[sd]];
+    if (softened && octree8_should_prune(sub, qv, prune_enabled, prune_r_cut_sq)) {
+      continue;
+    }
     if (sub.is_leaf) {
       for (uint32_t i = sub.start; i < sub.end; i++) {
         total += softened ? gravityGradSoftCutoff<3>(leaf_data[i], qv)
@@ -1870,8 +2221,12 @@ __global__ void stochastic_bh_force_octree8_kernel(
       VectorNd<3> weighted_diff_all = VectorNd<3>::Zero();
       VectorNd<3> dcur = qv - VectorNd<3>(cur_node->cx, cur_node->cy, cur_node->cz);
       dcur = minImageDisplacement<3>(dcur);
-      float cur_beta = fmaxf(1.0f, (float)(dcur.norm() / cur_node->diameter));
+      float cur_beta = fmaxf(beta, (float)(dcur.norm() / cur_node->diameter));
       while (!cur_node->is_leaf) {
+        if (softened &&
+            octree8_should_prune(*cur_node, qv, prune_enabled, prune_r_cut_sq)) {
+          break;
+        }
         VectorNd<3> dnode = qv - VectorNd<3>(cur_node->cx, cur_node->cy, cur_node->cz);
         dnode = minImageDisplacement<3>(dnode);
         float dist = dnode.norm();
@@ -1901,6 +2256,10 @@ __global__ void stochastic_bh_force_octree8_kernel(
             continue;
           }
           const OctreeNode8& child = nodes[prev_node->child[cc]];
+          if (softened &&
+              octree8_should_prune(child, qv, prune_enabled, prune_r_cut_sq)) {
+            continue;
+          }
           if (child.is_leaf) {
             for (uint32_t i = child.start; i < child.end; i++) {
               cur_result += softened
@@ -1911,6 +2270,157 @@ __global__ void stochastic_bh_force_octree8_kernel(
             cur_result +=
                 softened ? gravityGradSoftCutoff<3>(child.contrib, qv)
                          : gravityGrad<3>(child.contrib, qv);
+          }
+        }
+        VectorNd<3> diff = cur_result - prev_result;
+        float prob_inv =
+            static_cast<float>(num_elements) /
+            (event_prob * static_cast<float>(prev_node->end - prev_node->start));
+        weighted_diff_all += prob_inv * diff;
+      }
+      sub_total += weighted_diff_all;
+    }
+    if (samples_per_subdomain > 0) {
+      total += sub_total / static_cast<float>(samples_per_subdomain);
+    }
+  }
+
+  out[q * 3 + 0] = total(0);
+  out[q * 3 + 1] = total(1);
+  out[q * 3 + 2] = total(2);
+}
+
+__global__ void stochastic_bh_force_octree8_vjp_kernel(
+    const Leaf3* leaf_data, const OctreeNode8* nodes, const float* queries,
+    const float* cotangent, int num_queries, int samples_per_subdomain, int seed,
+    float beta, float* out, bool softened, int prune_enabled,
+    float prune_r_cut_sq) {
+  int q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q >= num_queries) {
+    return;
+  }
+  VectorNd<3> qv;
+  qv(0) = queries[q * 3 + 0];
+  qv(1) = queries[q * 3 + 1];
+  qv(2) = queries[q * 3 + 2];
+
+  VectorNd<3> gv;
+  gv(0) = cotangent[q * 3 + 0];
+  gv(1) = cotangent[q * 3 + 1];
+  gv(2) = cotangent[q * 3 + 2];
+
+  VectorNd<3> total = VectorNd<3>::Zero();
+  curandState s;
+  curandState s2;
+  curand_init(seed + q, 0, 0, &s);
+  curand_init(seed + q + 0x9e3779b9, 0, 0, &s2);
+
+  static constexpr int kControlDepth = 3;
+  static constexpr int kMaxControlSubdomains = 512;
+  int stack[128];
+  int top = 0;
+  stack[top++] = 0;
+  uint32_t subdomain_indices[kMaxControlSubdomains];
+  int num_subdomains = 0;
+  while (top > 0) {
+    int idx = stack[--top];
+    const OctreeNode8& node = nodes[idx];
+    if (node.contrib.mass == 0.0f) {
+      continue;
+    }
+    if (node.is_leaf || node.depth >= kControlDepth) {
+      if (num_subdomains < kMaxControlSubdomains) {
+        subdomain_indices[num_subdomains++] = static_cast<uint32_t>(idx);
+      }
+      continue;
+    }
+    uint8_t mask = node.child_mask;
+    for (int c = 0; c < 8; c++) {
+      if (mask & (1u << c)) {
+        stack[top++] = static_cast<int>(node.child[c]);
+      }
+    }
+  }
+
+  for (int sd = 0; sd < num_subdomains; sd++) {
+    const OctreeNode8& sub = nodes[subdomain_indices[sd]];
+    if (softened && octree8_should_prune(sub, qv, prune_enabled, prune_r_cut_sq)) {
+      continue;
+    }
+    if (sub.is_leaf) {
+      for (uint32_t i = sub.start; i < sub.end; i++) {
+        total += softened ? gravityGradSoftCutoffVjp<3>(leaf_data[i], qv, gv)
+                          : gravityGradVjp<3>(leaf_data[i], qv, gv);
+      }
+    } else {
+      total += softened ? gravityGradSoftCutoffVjp<3>(sub.contrib, qv, gv)
+                        : gravityGradVjp<3>(sub.contrib, qv, gv);
+    }
+
+    uint32_t num_elements = sub.end - sub.start;
+    VectorNd<3> sub_total = VectorNd<3>::Zero();
+    for (int ss = 0; ss < samples_per_subdomain; ss++) {
+      uint32_t idx =
+          min(static_cast<uint32_t>(num_elements * curand_uniform(&s2)) +
+                  sub.start,
+              sub.end - 1);
+      VectorNd<3> sample_pos = leaf_data[idx].position;
+
+      const OctreeNode8* prev_node = &sub;
+      const OctreeNode8* cur_node = &sub;
+      float event_prob = 1.0f;
+      VectorNd<3> weighted_diff_all = VectorNd<3>::Zero();
+      VectorNd<3> dcur = qv - VectorNd<3>(cur_node->cx, cur_node->cy, cur_node->cz);
+      dcur = minImageDisplacement<3>(dcur);
+      float cur_beta = fmaxf(beta, (float)(dcur.norm() / cur_node->diameter));
+      while (!cur_node->is_leaf) {
+        if (softened &&
+            octree8_should_prune(*cur_node, qv, prune_enabled, prune_r_cut_sq)) {
+          break;
+        }
+        VectorNd<3> dnode = qv - VectorNd<3>(cur_node->cx, cur_node->cy, cur_node->cz);
+        dnode = minImageDisplacement<3>(dnode);
+        float dist = dnode.norm();
+        float far_field_ratio = dist / cur_node->diameter;
+        float traverse_prob = fminf(cur_beta / far_field_ratio, 1.0f);
+        float p = curand_uniform(&s);
+        if (p > traverse_prob) {
+          event_prob *= 1.0f - traverse_prob;
+          break;
+        }
+        event_prob *= traverse_prob;
+        prev_node = cur_node;
+        uint32_t slot = octree8_child_slot(*cur_node, sample_pos);
+        if (!(cur_node->child_mask & (1u << slot))) {
+          break;
+        }
+        cur_node = &nodes[cur_node->child[slot]];
+        cur_beta = fmaxf(cur_beta, far_field_ratio);
+
+        VectorNd<3> prev_result =
+            softened ? gravityGradSoftCutoffVjp<3>(prev_node->contrib, qv, gv)
+                     : gravityGradVjp<3>(prev_node->contrib, qv, gv);
+        VectorNd<3> cur_result = VectorNd<3>::Zero();
+        uint8_t mask = prev_node->child_mask;
+        for (int cc = 0; cc < 8; cc++) {
+          if (!(mask & (1u << cc))) {
+            continue;
+          }
+          const OctreeNode8& child = nodes[prev_node->child[cc]];
+          if (softened &&
+              octree8_should_prune(child, qv, prune_enabled, prune_r_cut_sq)) {
+            continue;
+          }
+          if (child.is_leaf) {
+            for (uint32_t i = child.start; i < child.end; i++) {
+              cur_result += softened
+                                ? gravityGradSoftCutoffVjp<3>(leaf_data[i], qv, gv)
+                                : gravityGradVjp<3>(leaf_data[i], qv, gv);
+            }
+          } else {
+            cur_result += softened
+                              ? gravityGradSoftCutoffVjp<3>(child.contrib, qv, gv)
+                              : gravityGradVjp<3>(child.contrib, qv, gv);
           }
         }
         VectorNd<3> diff = cur_result - prev_result;
@@ -2678,6 +3188,8 @@ xla::ffi::Error SoftenedBarnesHutForceOctree8(cudaStream_t stream,
                                               float beta,
                                               float softening_scale,
                                               float cutoff_scale,
+                                              int prune_enabled,
+                                              float prune_r_cut_mult,
                                               int periodic,
                                               float box_length,
                                               int threads) {
@@ -2698,6 +3210,10 @@ xla::ffi::Error SoftenedBarnesHutForceOctree8(cudaStream_t stream,
   if (threads <= 0 || threads > 1024) {
     return xla::ffi::Error::InvalidArgument("threads must be in [1, 1024]");
   }
+  if (prune_enabled != 0 && prune_r_cut_mult <= 0.0f) {
+    return xla::ffi::Error::InvalidArgument(
+        "prune_r_cut_mult must be > 0 when prune_enabled is set");
+  }
 
   cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
   if (per_err != cudaSuccess) {
@@ -2716,9 +3232,13 @@ xla::ffi::Error SoftenedBarnesHutForceOctree8(cudaStream_t stream,
   const float* queries_ptr = queries.typed_data();
   float* out_ptr = out->typed_data();
 
+  int prune_on = (prune_enabled != 0 && cutoff_scale > 0.0f) ? 1 : 0;
+  float r_cut = prune_on ? prune_r_cut_mult * cutoff_scale : 0.0f;
+  float r_cut_sq = r_cut * r_cut;
   int blocks = (num_queries + threads - 1) / threads;
   barnes_hut_force_octree8_soft_kernel<<<blocks, threads, 0, stream>>>(
-      leaf_data, nodes, queries_ptr, num_queries, beta, out_ptr);
+      leaf_data, nodes, queries_ptr, num_queries, beta, prune_on, r_cut_sq,
+      out_ptr);
 
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
@@ -2736,6 +3256,8 @@ xla::ffi::Error SoftenedBarnesHutForceOctree8Vjp(cudaStream_t stream,
                                                  float beta,
                                                  float softening_scale,
                                                  float cutoff_scale,
+                                                 int prune_enabled,
+                                                 float prune_r_cut_mult,
                                                  int periodic,
                                                  float box_length,
                                                  int threads) {
@@ -2759,6 +3281,10 @@ xla::ffi::Error SoftenedBarnesHutForceOctree8Vjp(cudaStream_t stream,
   if (threads <= 0 || threads > 1024) {
     return xla::ffi::Error::InvalidArgument("threads must be in [1, 1024]");
   }
+  if (prune_enabled != 0 && prune_r_cut_mult <= 0.0f) {
+    return xla::ffi::Error::InvalidArgument(
+        "prune_r_cut_mult must be > 0 when prune_enabled is set");
+  }
 
   cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
   if (per_err != cudaSuccess) {
@@ -2778,9 +3304,13 @@ xla::ffi::Error SoftenedBarnesHutForceOctree8Vjp(cudaStream_t stream,
   const float* cotangent_ptr = cotangent.typed_data();
   float* out_ptr = out->typed_data();
 
+  int prune_on = (prune_enabled != 0 && cutoff_scale > 0.0f) ? 1 : 0;
+  float r_cut = prune_on ? prune_r_cut_mult * cutoff_scale : 0.0f;
+  float r_cut_sq = r_cut * r_cut;
   int blocks = (num_queries + threads - 1) / threads;
   barnes_hut_force_octree8_soft_vjp_kernel<<<blocks, threads, 0, stream>>>(
-      leaf_data, nodes, queries_ptr, cotangent_ptr, num_queries, beta, out_ptr);
+      leaf_data, nodes, queries_ptr, cotangent_ptr, num_queries, beta, prune_on,
+      r_cut_sq, out_ptr);
 
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
@@ -2796,6 +3326,7 @@ xla::ffi::Error StochasticBarnesHutForceOctree8(cudaStream_t stream,
                                                 F32R2Out out,
                                                 int samples_per_subdomain,
                                                 int seed,
+                                                float beta,
                                                 int periodic,
                                                 float box_length,
                                                 int threads) {
@@ -2832,7 +3363,7 @@ xla::ffi::Error StochasticBarnesHutForceOctree8(cudaStream_t stream,
   int blocks = (num_queries + threads - 1) / threads;
   stochastic_bh_force_octree8_kernel<<<blocks, threads, 0, stream>>>(
       leaf_data, nodes, queries_ptr, num_queries, samples_per_subdomain, seed,
-      out_ptr, false);
+      beta, out_ptr, false, 0, 0.0f);
 
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
@@ -2849,8 +3380,11 @@ xla::ffi::Error SoftenedStochasticBarnesHutForceOctree8(
     F32R2Out out,
     int samples_per_subdomain,
     int seed,
+    float beta,
     float softening_scale,
     float cutoff_scale,
+    int prune_enabled,
+    float prune_r_cut_mult,
     int periodic,
     float box_length,
     int threads) {
@@ -2871,6 +3405,10 @@ xla::ffi::Error SoftenedStochasticBarnesHutForceOctree8(
   if (threads <= 0 || threads > 1024) {
     return xla::ffi::Error::InvalidArgument("threads must be in [1, 1024]");
   }
+  if (prune_enabled != 0 && prune_r_cut_mult <= 0.0f) {
+    return xla::ffi::Error::InvalidArgument(
+        "prune_r_cut_mult must be > 0 when prune_enabled is set");
+  }
 
   cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
   if (per_err != cudaSuccess) {
@@ -2889,10 +3427,146 @@ xla::ffi::Error SoftenedStochasticBarnesHutForceOctree8(
   const float* queries_ptr = queries.typed_data();
   float* out_ptr = out->typed_data();
 
+  int prune_on = (prune_enabled != 0 && cutoff_scale > 0.0f) ? 1 : 0;
+  float r_cut = prune_on ? prune_r_cut_mult * cutoff_scale : 0.0f;
+  float r_cut_sq = r_cut * r_cut;
   int blocks = (num_queries + threads - 1) / threads;
   stochastic_bh_force_octree8_kernel<<<blocks, threads, 0, stream>>>(
       leaf_data, nodes, queries_ptr, num_queries, samples_per_subdomain, seed,
-      out_ptr, true);
+      beta, out_ptr, true, prune_on, r_cut_sq);
+
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    return xla::ffi::Error::Internal(cudaGetErrorString(err));
+  }
+  return xla::ffi::Error::Success();
+}
+
+xla::ffi::Error StochasticBarnesHutForceOctree8Vjp(cudaStream_t stream,
+                                                   U8R1 leaf_bytes,
+                                                   U8R1 node_bytes,
+                                                   F32R2 queries,
+                                                   F32R2 cotangent,
+                                                   F32R2Out out,
+                                                   int samples_per_subdomain,
+                                                   int seed,
+                                                   float beta,
+                                                   int periodic,
+                                                   float box_length,
+                                                   int threads) {
+  if (leaf_bytes.size_bytes() % sizeof(Leaf3) != 0) {
+    return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
+  }
+  if (node_bytes.size_bytes() % sizeof(OctreeNode8) != 0) {
+    return xla::ffi::Error::InvalidArgument("node_bytes size mismatch");
+  }
+  int num_queries = static_cast<int>(queries.dimensions()[0]);
+  if (queries.dimensions()[1] != 3) {
+    return xla::ffi::Error::InvalidArgument("queries dim must be 3");
+  }
+  if (cotangent.dimensions()[0] != num_queries || cotangent.dimensions()[1] != 3) {
+    return xla::ffi::Error::InvalidArgument("cotangent shape mismatch");
+  }
+  auto out_dims = out->dimensions();
+  if (out_dims[0] != num_queries || out_dims[1] != 3) {
+    return xla::ffi::Error::InvalidArgument("out shape mismatch");
+  }
+  if (threads <= 0 || threads > 1024) {
+    return xla::ffi::Error::InvalidArgument("threads must be in [1, 1024]");
+  }
+
+  cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
+  if (per_err != cudaSuccess) {
+    return xla::ffi::Error::Internal(cudaGetErrorString(per_err));
+  }
+
+  const Leaf3* leaf_data =
+      reinterpret_cast<const Leaf3*>(leaf_bytes.untyped_data());
+  const OctreeNode8* nodes =
+      reinterpret_cast<const OctreeNode8*>(node_bytes.untyped_data());
+  const float* queries_ptr = queries.typed_data();
+  const float* cotangent_ptr = cotangent.typed_data();
+  float* out_ptr = out->typed_data();
+
+  int blocks = (num_queries + threads - 1) / threads;
+  stochastic_bh_force_octree8_vjp_kernel<<<blocks, threads, 0, stream>>>(
+      leaf_data, nodes, queries_ptr, cotangent_ptr, num_queries,
+      samples_per_subdomain, seed, beta, out_ptr, false, 0, 0.0f);
+
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    return xla::ffi::Error::Internal(cudaGetErrorString(err));
+  }
+  return xla::ffi::Error::Success();
+}
+
+xla::ffi::Error SoftenedStochasticBarnesHutForceOctree8Vjp(
+    cudaStream_t stream,
+    U8R1 leaf_bytes,
+    U8R1 node_bytes,
+    F32R2 queries,
+    F32R2 cotangent,
+    F32R2Out out,
+    int samples_per_subdomain,
+    int seed,
+    float beta,
+    float softening_scale,
+    float cutoff_scale,
+    int prune_enabled,
+    float prune_r_cut_mult,
+    int periodic,
+    float box_length,
+    int threads) {
+  if (leaf_bytes.size_bytes() % sizeof(Leaf3) != 0) {
+    return xla::ffi::Error::InvalidArgument("leaf_bytes size mismatch");
+  }
+  if (node_bytes.size_bytes() % sizeof(OctreeNode8) != 0) {
+    return xla::ffi::Error::InvalidArgument("node_bytes size mismatch");
+  }
+  int num_queries = static_cast<int>(queries.dimensions()[0]);
+  if (queries.dimensions()[1] != 3) {
+    return xla::ffi::Error::InvalidArgument("queries dim must be 3");
+  }
+  if (cotangent.dimensions()[0] != num_queries || cotangent.dimensions()[1] != 3) {
+    return xla::ffi::Error::InvalidArgument("cotangent shape mismatch");
+  }
+  auto out_dims = out->dimensions();
+  if (out_dims[0] != num_queries || out_dims[1] != 3) {
+    return xla::ffi::Error::InvalidArgument("out shape mismatch");
+  }
+  if (threads <= 0 || threads > 1024) {
+    return xla::ffi::Error::InvalidArgument("threads must be in [1, 1024]");
+  }
+  if (prune_enabled != 0 && prune_r_cut_mult <= 0.0f) {
+    return xla::ffi::Error::InvalidArgument(
+        "prune_r_cut_mult must be > 0 when prune_enabled is set");
+  }
+
+  cudaError_t per_err = SetPeriodicBox(stream, periodic, box_length);
+  if (per_err != cudaSuccess) {
+    return xla::ffi::Error::Internal(cudaGetErrorString(per_err));
+  }
+
+  cudaError_t set_err = SetSofteningCutoff(stream, softening_scale, cutoff_scale);
+  if (set_err != cudaSuccess) {
+    return xla::ffi::Error::Internal(cudaGetErrorString(set_err));
+  }
+
+  const Leaf3* leaf_data =
+      reinterpret_cast<const Leaf3*>(leaf_bytes.untyped_data());
+  const OctreeNode8* nodes =
+      reinterpret_cast<const OctreeNode8*>(node_bytes.untyped_data());
+  const float* queries_ptr = queries.typed_data();
+  const float* cotangent_ptr = cotangent.typed_data();
+  float* out_ptr = out->typed_data();
+
+  int prune_on = (prune_enabled != 0 && cutoff_scale > 0.0f) ? 1 : 0;
+  float r_cut = prune_on ? prune_r_cut_mult * cutoff_scale : 0.0f;
+  float r_cut_sq = r_cut * r_cut;
+  int blocks = (num_queries + threads - 1) / threads;
+  stochastic_bh_force_octree8_vjp_kernel<<<blocks, threads, 0, stream>>>(
+      leaf_data, nodes, queries_ptr, cotangent_ptr, num_queries,
+      samples_per_subdomain, seed, beta, out_ptr, true, prune_on, r_cut_sq);
 
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
@@ -2911,6 +3585,35 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<sbh_ffi::F32R1>()
         .Arg<sbh_ffi::F32R2>()
         .Ret<sbh_ffi::F32R1>()
+        .Attr<int>("periodic")
+        .Attr<float>("box_length")
+        .Attr<int>("threads"));
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    sbh_direct_force_soft_ffi, sbh_ffi::SoftenedDirectForce,
+    xla::ffi::Ffi::Bind()
+        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Arg<sbh_ffi::F32R2>()
+        .Arg<sbh_ffi::F32R1>()
+        .Arg<sbh_ffi::F32R2>()
+        .Ret<sbh_ffi::F32R2>()
+        .Attr<float>("softening_scale")
+        .Attr<float>("cutoff_scale")
+        .Attr<int>("periodic")
+        .Attr<float>("box_length")
+        .Attr<int>("threads"));
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    sbh_direct_force_soft_vjp_ffi, sbh_ffi::SoftenedDirectForceVjp,
+    xla::ffi::Ffi::Bind()
+        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Arg<sbh_ffi::F32R2>()
+        .Arg<sbh_ffi::F32R1>()
+        .Arg<sbh_ffi::F32R2>()
+        .Arg<sbh_ffi::F32R2>()
+        .Ret<sbh_ffi::F32R2>()
+        .Attr<float>("softening_scale")
+        .Attr<float>("cutoff_scale")
         .Attr<int>("periodic")
         .Attr<float>("box_length")
         .Attr<int>("threads"));
@@ -3019,6 +3722,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<float>("beta")
         .Attr<float>("softening_scale")
         .Attr<float>("cutoff_scale")
+        .Attr<int>("prune_enabled")
+        .Attr<float>("prune_r_cut_mult")
         .Attr<int>("periodic")
         .Attr<float>("box_length")
         .Attr<int>("threads"));
@@ -3036,6 +3741,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<float>("beta")
         .Attr<float>("softening_scale")
         .Attr<float>("cutoff_scale")
+        .Attr<int>("prune_enabled")
+        .Attr<float>("prune_r_cut_mult")
         .Attr<int>("periodic")
         .Attr<float>("box_length")
         .Attr<int>("threads"));
@@ -3141,6 +3848,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<sbh_ffi::F32R2>()
         .Attr<int>("samples_per_subdomain")
         .Attr<int>("seed")
+        .Attr<float>("beta")
         .Attr<int>("periodic")
         .Attr<float>("box_length")
         .Attr<int>("threads"));
@@ -3156,8 +3864,49 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<sbh_ffi::F32R2>()
         .Attr<int>("samples_per_subdomain")
         .Attr<int>("seed")
+        .Attr<float>("beta")
         .Attr<float>("softening_scale")
         .Attr<float>("cutoff_scale")
+        .Attr<int>("prune_enabled")
+        .Attr<float>("prune_r_cut_mult")
+        .Attr<int>("periodic")
+        .Attr<float>("box_length")
+        .Attr<int>("threads"));
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    sbh_stochastic_bh_force_octree8_vjp_ffi,
+    sbh_ffi::StochasticBarnesHutForceOctree8Vjp,
+    xla::ffi::Ffi::Bind()
+        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Arg<sbh_ffi::U8R1>()
+        .Arg<sbh_ffi::U8R1>()
+        .Arg<sbh_ffi::F32R2>()
+        .Arg<sbh_ffi::F32R2>()
+        .Ret<sbh_ffi::F32R2>()
+        .Attr<int>("samples_per_subdomain")
+        .Attr<int>("seed")
+        .Attr<float>("beta")
+        .Attr<int>("periodic")
+        .Attr<float>("box_length")
+        .Attr<int>("threads"));
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    sbh_stochastic_bh_force_octree8_soft_vjp_ffi,
+    sbh_ffi::SoftenedStochasticBarnesHutForceOctree8Vjp,
+    xla::ffi::Ffi::Bind()
+        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Arg<sbh_ffi::U8R1>()
+        .Arg<sbh_ffi::U8R1>()
+        .Arg<sbh_ffi::F32R2>()
+        .Arg<sbh_ffi::F32R2>()
+        .Ret<sbh_ffi::F32R2>()
+        .Attr<int>("samples_per_subdomain")
+        .Attr<int>("seed")
+        .Attr<float>("beta")
+        .Attr<float>("softening_scale")
+        .Attr<float>("cutoff_scale")
+        .Attr<int>("prune_enabled")
+        .Attr<float>("prune_r_cut_mult")
         .Attr<int>("periodic")
         .Attr<float>("box_length")
         .Attr<int>("threads"));

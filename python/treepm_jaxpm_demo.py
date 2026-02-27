@@ -28,6 +28,8 @@ class Config:
     pm_r_split_cells: float
     tree_short_scale: float
     seed: int
+    bh_prune_enabled: bool = True
+    bh_prune_r_cut_mult: float = 4.0
 
 
 def _make_lattice_positions(n: int) -> jnp.ndarray:
@@ -69,6 +71,8 @@ def _bh_short_force_mesh(
         beta=cfg.bh_beta,
         softening_scale=cfg.bh_softening,
         cutoff_scale=cfg.pm_r_split_cells,
+        prune_enabled=cfg.bh_prune_enabled,
+        prune_r_cut_mult=cfg.bh_prune_r_cut_mult,
         periodic=True,
         box_length=float(cfg.mesh_n),
     )
@@ -314,6 +318,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bh-beta", type=float, default=1.7)
     p.add_argument("--bh-softening", type=float, default=0.1)
     p.add_argument("--bh-max-depth", type=int, default=6)
+    p.add_argument(
+        "--bh-prune-enabled",
+        type=int,
+        default=1,
+        help="Enable AABB distance pruning for softened BH short-range (1/0).",
+    )
+    p.add_argument(
+        "--bh-prune-r-cut-mult",
+        type=float,
+        default=4.0,
+        help="Prune radius multiplier: r_cut = bh_prune_r_cut_mult * pm_r_split_cells.",
+    )
     p.add_argument("--out-npz", type=str, default="treepm_jaxpm_demo.npz")
     p.add_argument("--out-proj-png", type=str, default="treepm_jaxpm_projected_density.png")
     p.add_argument("--out-pk-png", type=str, default="treepm_jaxpm_power_spectra.png")
@@ -336,6 +352,8 @@ def main() -> None:
         pm_r_split_cells=args.pm_r_split_cells,
         tree_short_scale=args.tree_short_scale,
         seed=args.seed,
+        bh_prune_enabled=bool(args.bh_prune_enabled),
+        bh_prune_r_cut_mult=args.bh_prune_r_cut_mult,
     )
     run(cfg, args.out_npz, args.out_proj_png, args.out_pk_png)
 
