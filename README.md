@@ -51,6 +51,7 @@ Exact performance characteristics of the various implementations will depend hea
 
 
 N = 10,000
+
 method                   | status | rel_l2    | outlier_frac | compute_ms | compile_ms
 -------------------------+--------+-----------+--------------+------------+-----------
 cpu_numpy_direct         | ok     | 0.000e+00 | 0.000        | 5324.467   | NA        
@@ -62,6 +63,7 @@ stochastic_bh_l3         | ok     | 2.705e-06 | 0.000        | 7.877      | NA
 stochastic_bh_octree8    | ok     | 2.374e-06 | 0.000        | 9.485      | NA        
 
 N=1,000,000 (impossible for pure JAX and CPU on my system)
+
 method                | status | rel_l2    | outlier_frac | compute_ms | compile_ms
 ----------------------+--------+-----------+--------------+------------+-----------
 ffi_cuda_direct       | ok     | 0.000e+00 | 0.000        | 12766.763  | NA        
